@@ -1,0 +1,20 @@
+dv:
+  network: /hkustgz
+  router: /hkustgz/p0
+  keychain: "insecure"
+  neighbors:
+    - uri: "udp://10.0.1.1:6363"
+
+fw:
+  faces:
+    udp:
+      enabled_unicast: true
+      enabled_multicast: false
+      port_unicast: 6363
+    tcp:
+      enabled: true
+      port_unicast: 6363
+    websocket:
+      enabled: false
+  fw:
+    threads: 2
