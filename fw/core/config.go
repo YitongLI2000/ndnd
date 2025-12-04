@@ -115,6 +115,10 @@ type Config struct {
 		QueueSize int `json:"queue_size"`
 		// If true, face threads will be locked to processor cores
 		LockThreadsToCores bool `json:"lock_threads_to_cores"`
+
+		//TODO: added by Yitong
+		// The NDN Name of this node/router
+		StrategyNodeName string `json:"strategy_node_name"`
 	} `json:"fw"`
 
 	Mgmt struct {
@@ -168,6 +172,10 @@ type Config struct {
 // (AI GENERATED DESCRIPTION): Creates and returns a `Config` object pre‑populated with default settings for core parameters, face types, forwarding, management, and table options.
 func DefaultConfig() *Config {
 	c := &Config{}
+
+	//TODO: added by Yitong
+	c.Fw.StrategyNodeName = ""
+
 	c.Core.LogLevel = "INFO"
 	c.Core.LogFile = ""
 

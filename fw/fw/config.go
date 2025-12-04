@@ -7,7 +7,10 @@
 
 package fw
 
-import "github.com/named-data/ndnd/fw/core"
+import (
+	"github.com/named-data/ndnd/fw/core"
+	enc "github.com/named-data/ndnd/std/encoding"
+)
 
 // FwQueueSize is the maxmimum number of packets that can be buffered to be processed by a forwarding thread.
 func CfgFwQueueSize() int {
@@ -22,4 +25,17 @@ func CfgNumThreads() int {
 // LockThreadsToCores indicates whether forwarding threads will be locked to cores.
 func CfgLockThreadsToCores() bool {
 	return core.C.Fw.LockThreadsToCores
+}
+
+// TODO: added by Yitong
+// CfgNodeName returns the configured Node Name as an NDN Name object.
+func CfgNodeName() enc.Name {
+	// Parse the string from the config into an NDN Name
+	name, err := enc.NameFromStr(core.C.Fw.StrategyNodeName)
+	if err != nil {
+		// Fallback if configuration is invalid
+		core.Log.Error(nil, "Invalid Node Name in config, using default", "err", err)
+		name, _ = enc.NameFromStr("/my-node")
+	}
+	return name
 }

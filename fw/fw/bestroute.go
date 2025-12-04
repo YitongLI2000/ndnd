@@ -71,6 +71,20 @@ func (s *BestRoute) AfterReceiveInterest(
 		return
 	}
 
+	//TODO: added by Yitong
+	// Added logging for con0 and /pro prefix to inspect FIB details
+	// We convert StrategyNodeName to string to check if it contains "con0"
+	// Note: enc.Name.String() usually returns a URI format like "/con0", so we check if it contains the name.
+	// if strings.Contains(s.StrategyNodeName.String(), "con0") && strings.HasPrefix(packet.Name.String(), "/pro") {
+	// 	core.Log.Info(s, "FIB Inspection", "prefix", packet.Name, "nexthop_count", len(nexthops))
+	// 	for _, nh := range nexthops {
+	// 		core.Log.Info(s, " - FIB Entry", "nexthop_face", nh.Nexthop, "cost", nh.Cost)
+	// 	}
+	// }
+
+	// StrategyNodeName is enc.Name, so we use .String() for logging
+	core.Log.Info(s, "Processing Interest", "NDN forwarder: ", s.StrategyNodeName.String(), "Interest Name: ", packet.Name.String())
+
 	// Sort nexthops by cost and send to best-possible nexthop
 	sort.Slice(nexthops, func(i, j int) bool { return nexthops[i].Cost < nexthops[j].Cost })
 

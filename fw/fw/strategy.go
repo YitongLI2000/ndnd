@@ -46,6 +46,9 @@ type StrategyBase struct {
 	name     enc.Name
 	version  uint64
 	logName  string
+
+	//TODO: added by Yitong
+	StrategyNodeName enc.Name
 }
 
 // NewStrategyBase is a helper that allows specific strategies to initialize the base.
@@ -61,6 +64,9 @@ func (s *StrategyBase) NewStrategyBase(
 		Append(enc.NewVersionComponent(version))
 	s.version = version
 	s.logName = name
+
+	//TODO: added by Yitong
+	s.StrategyNodeName = CfgNodeName()
 }
 
 // (AI GENERATED DESCRIPTION): Returns a formatted string containing the strategy's log name, version, and thread ID.
