@@ -19,7 +19,7 @@ import (
 
 const (
 	INIT_INTEREST_RATE    = 2000.0                 // Initial Rate: 2000 interests/sec
-	TOTAL_DURATION        = 10 * time.Second       // Max duration (hard stop)
+	TOTAL_DURATION        = 30 * time.Second       // Max duration (hard stop)
 	MAX_PACKETS           = 30000                  // Target packets to receive per flow
 	INTEREST_LIFETIME     = 4 * time.Second        // Individual Interest lifetime
 	RTT_WINDOW_DURATION   = 1 * time.Second        // Duration to keep RTT samples for RTO

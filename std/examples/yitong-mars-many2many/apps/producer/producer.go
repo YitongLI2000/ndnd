@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"ndnd-mars-one2many/internal/datapacket"
+	"ndnd-mars-many2many/internal/datapacket"
 	"os"
 	"os/signal"
 	"path/filepath"

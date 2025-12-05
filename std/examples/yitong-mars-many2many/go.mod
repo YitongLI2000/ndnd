@@ -1,4 +1,4 @@
-module ndnd-mars-one2many
+module ndnd-mars-many2many
 
 go 1.24.3
 

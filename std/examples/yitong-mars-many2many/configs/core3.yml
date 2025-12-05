@@ -1,0 +1,39 @@
+dv:
+  network: /hkustgz
+  router: /hkustgz/core3
+  keychain: "insecure"
+  neighbors:
+    - uri: "udp://172.16.1.53:6363"  # Neighbor: core0
+    - uri: "udp://172.16.1.65:6363"  # Neighbor: core1
+    - uri: "udp://172.16.1.73:6363"  # Neighbor: core2
+    - uri: "udp://172.16.1.82:6363"  # Neighbor: core4
+    - uri: "udp://172.16.0.161:6363" # Neighbor: edge15
+    - uri: "udp://172.16.0.165:6363" # Neighbor: edge16
+    - uri: "udp://172.16.0.169:6363" # Neighbor: edge17
+    - uri: "udp://172.16.0.173:6363" # Neighbor: edge18
+    - uri: "udp://172.16.0.177:6363" # Neighbor: edge19
+    - uri: "udp://172.16.0.213:6363" # Neighbor: con0
+    - uri: "udp://172.16.0.233:6363" # Neighbor: con1
+    - uri: "udp://172.16.0.253:6363" # Neighbor: con2
+    - uri: "udp://172.16.1.17:6363"  # Neighbor: con3
+    - uri: "udp://172.16.1.37:6363"  # Neighbor: con4
+  advertise_interval: 1000
+  router_dead_interval: 300000
+
+fw:
+  core:
+    log_level: DEBUG
+  faces:
+    udp:
+      enabled_unicast: true
+      enabled_multicast: false
+      port_unicast: 6363
+      # default_mtu: 1420
+    tcp:
+      enabled: true
+      port_unicast: 6363
+    websocket:
+      enabled: false
+  fw:
+    threads: 16
+    strategy_node_name: core3

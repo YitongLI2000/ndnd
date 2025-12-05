@@ -1,0 +1,26 @@
+dv:
+  network: /hkustgz
+  router: /hkustgz/pro9
+  keychain: "insecure"
+  neighbors:
+    - uri: "udp://172.16.0.38:6363" # Neighbor: edge9
+  advertise_interval: 1000
+  router_dead_interval: 300000
+
+fw:
+  core:
+    log_level: DEBUG   
+  faces:
+    udp:
+      enabled_unicast: true
+      enabled_multicast: false
+      port_unicast: 6363
+      # default_mtu: 1420
+    tcp:
+      enabled: true
+      port_unicast: 6363
+    websocket:
+      enabled: false
+  fw:
+    threads: 16
+    strategy_node_name: pro9
