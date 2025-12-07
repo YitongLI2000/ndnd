@@ -185,7 +185,9 @@ func DefaultConfig() *Config {
 	c.Core.BlockProfile = ""
 
 	c.Faces.QueueSize = 1024
-	c.Faces.CongestionMarking = true
+	//todo:debug, changed by Yitong
+	c.Faces.CongestionMarking = false
+	// c.Faces.CongestionMarking = true
 	c.Faces.LockThreadsToCores = false
 
 	c.Faces.Udp.EnabledUnicast = true
@@ -227,9 +229,13 @@ func DefaultConfig() *Config {
 
 	c.Mgmt.AllowLocalhop = false
 
-	c.Tables.ContentStore.Capacity = 1024
-	c.Tables.ContentStore.Admit = true
-	c.Tables.ContentStore.Serve = true
+	//TODO:debug, changed by Yitong
+	// c.Tables.ContentStore.Capacity = 1024
+	// c.Tables.ContentStore.Admit = true
+	// c.Tables.ContentStore.Serve = true
+	c.Tables.ContentStore.Capacity = 1
+	c.Tables.ContentStore.Admit = false
+	c.Tables.ContentStore.Serve = false
 	c.Tables.ContentStore.ReplacementPolicy = "lru"
 
 	c.Tables.DeadNonceList.Lifetime = 6000

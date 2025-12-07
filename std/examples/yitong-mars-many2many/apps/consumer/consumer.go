@@ -18,15 +18,15 @@ import (
 )
 
 const (
-	INIT_INTEREST_RATE    = 2000.0                 // Initial Rate: 2000 interests/sec
-	TOTAL_DURATION        = 30 * time.Second       // Max duration (hard stop)
-	MAX_PACKETS           = 30000                  // Target packets to receive per flow
-	INTEREST_LIFETIME     = 4 * time.Second        // Individual Interest lifetime
-	RTT_WINDOW_DURATION   = 1 * time.Second        // Duration to keep RTT samples for RTO
-	MIN_RTO               = 30.0                   // Minimum RTO in milliseconds
-	MAX_RTO               = 100.0                  // Maximum RTO in milliseconds (Cap)
-	THROUGHPUT_WINDOW_DUR = 100 * time.Millisecond // Sliding window size for throughput/RTT
-	CHECK_INTERVAL        = 10 * time.Millisecond  // Retransmission check interval (Lowered for tighter control)
+	INIT_INTEREST_RATE    = 4000.0                // Initial Rate: 5000 interests/sec
+	TOTAL_DURATION        = 30 * time.Second      // Max duration (hard stop)
+	MAX_PACKETS           = 30000                 // Target packets to receive per flow
+	INTEREST_LIFETIME     = 4 * time.Second       // Individual Interest lifetime
+	RTT_WINDOW_DURATION   = 1 * time.Second       // Duration to keep RTT samples for RTO
+	MIN_RTO               = 30.0                  // Minimum RTO in milliseconds
+	MAX_RTO               = 100.0                 // Maximum RTO in milliseconds (Cap)
+	THROUGHPUT_WINDOW_DUR = 60 * time.Millisecond // Sliding window size for throughput/RTT
+	CHECK_INTERVAL        = 10 * time.Millisecond // Retransmission check interval (Lowered for tighter control)
 )
 
 // Create a tag for our consumer application
@@ -180,10 +180,10 @@ func (f *FlowContext) RecordPacket(payloadSize int, rttVal float64) {
 		// Determine Target Rate based on RTT comparison
 		targetRate := f.currentRate
 
-		if windowAvgRTT < 1.5*f.baseRTT {
+		if windowAvgRTT < 3*f.baseRTT {
 			// Low congestion: Probe more bandwidth
 			targetRate = f.currentRate * 1.1
-		} else if windowAvgRTT >= 1.5*f.baseRTT && windowAvgRTT < 2.0*f.baseRTT {
+		} else if windowAvgRTT >= 3*f.baseRTT && windowAvgRTT < 4.5*f.baseRTT {
 			// Moderate congestion: Hold rate
 			targetRate = f.currentRate
 		} else {
@@ -193,7 +193,7 @@ func (f *FlowContext) RecordPacket(payloadSize int, rttVal float64) {
 
 		// Apply Throughput Caps
 		lowerBound := 0.8 * measuredThroughputPPS
-		upperBound := 1.5 * measuredThroughputPPS
+		upperBound := 2.0 * measuredThroughputPPS
 
 		if lowerBound < 1.0 {
 			lowerBound = 1.0
@@ -342,7 +342,7 @@ func (rtt *RTTTracker) RecordDataReceived(dataName string, prefix string, receiv
 		meanRTT = rttSampleVal
 		variance = 0.0
 		calculatedRTO = math.Max(MIN_RTO, 2*rttSampleVal)
-		finalRTO = 2 * calculatedRTO
+		finalRTO = 3 * calculatedRTO
 	} else {
 		// Equation 1: Sample Mean RTT
 		var sum float64
@@ -363,8 +363,8 @@ func (rtt *RTTTracker) RecordDataReceived(dataName string, prefix string, receiv
 		stdDev := math.Sqrt(variance)
 		calculatedRTO = meanRTT + 4*stdDev
 
-		// Equation 4: RTO_threshold = 2 * RTO_final
-		finalRTO = 2 * calculatedRTO
+		// Equation 4: RTO_threshold = 3 * RTO_final
+		finalRTO = 3 * calculatedRTO
 	}
 
 	// Apply Constraints to Final RTO
@@ -635,19 +635,20 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 				globalRetxController.Remove(dataName)
 
 				// 1. RTO Calculation
-				rttSample, mean, variance, rto := globalRTTTracker.RecordDataReceived(dataName, prefix, receiveTime)
+				// rttSample, mean, variance, rto := globalRTTTracker.RecordDataReceived(dataName, prefix, receiveTime)
+				rttSample, _, _, _ := globalRTTTracker.RecordDataReceived(dataName, prefix, receiveTime)
 
 				// 2. Throughput & Rate Control Update
 				flowCtx.RecordPacket(len(content), rttSample)
 
-				log.Info(consumerTag, "Data Received",
-					"seq", sequenceNum,
-					"prefix", prefix,
-					"rtt", rttSample,
-					"MeanRTT", mean,
-					"Variance", variance,
-					"FinalRTO", rto,
-					"currentRate", flowCtx.GetRate())
+				// log.Info(consumerTag, "Data Received",
+				// 	"seq", sequenceNum,
+				// 	"prefix", prefix,
+				// 	"rtt", rttSample,
+				// 	"MeanRTT", mean,
+				// 	"Variance", variance,
+				// 	"FinalRTO", rto,
+				// 	"currentRate", flowCtx.GetRate())
 
 				stats.IncrementData()
 			}

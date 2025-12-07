@@ -83,7 +83,7 @@ func (s *BestRoute) AfterReceiveInterest(
 	// }
 
 	// StrategyNodeName is enc.Name, so we use .String() for logging
-	core.Log.Info(s, "Processing Interest", "NDN forwarder: ", s.StrategyNodeName.String(), "Interest Name: ", packet.Name.String())
+	// core.Log.Info(s, "Processing Interest", "NDN forwarder: ", s.StrategyNodeName.String(), "Interest Name: ", packet.Name.String())
 
 	// Sort nexthops by cost and send to best-possible nexthop
 	sort.Slice(nexthops, func(i, j int) bool { return nexthops[i].Cost < nexthops[j].Cost })

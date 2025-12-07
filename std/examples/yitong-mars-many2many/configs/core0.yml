@@ -22,7 +22,7 @@ dv:
 
 fw:
   core:
-    log_level: DEBUG
+    # log_level: DEBUG
   faces:
     udp:
       enabled_unicast: true
@@ -35,5 +35,5 @@ fw:
     websocket:
       enabled: false
   fw:
-    threads: 16
+    threads: 64
     strategy_node_name: core0

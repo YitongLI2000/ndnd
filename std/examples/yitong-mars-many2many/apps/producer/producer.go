@@ -59,9 +59,9 @@ func onInterest(args ndn.InterestHandlerArgs) {
 		return
 	}
 
-	fmt.Printf("<< D: %s\n", interest.Name().String())
-	fmt.Printf("Content: %s (size: %d bytes)\n", dataPacket.String(), len(content))
-	fmt.Printf("\n")
+	// fmt.Printf("<< D: %s\n", interest.Name().String())
+	// fmt.Printf("Content: %s (size: %d bytes)\n", dataPacket.String(), len(content))
+	// fmt.Printf("\n")
 }
 
 func main() {

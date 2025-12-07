@@ -13,7 +13,7 @@ import collections
 # --- Configuration ---
 # Loss rate in percentage (0 to 100). 
 # e.g., 0.001 means 0.001% packet loss. 1 means 1% packet loss.
-CON_TO_CORE_LOSS = 1
+CON_TO_CORE_LOSS = 0
 
 # --- Topology Definition ---
 NODES = [
@@ -296,8 +296,8 @@ def run_applications(net):
     logs_dir = os.path.join(script_dir, '..', 'logs')
     
     # Step 1 (Cont.): Wait for convergence
-    print("\nWaiting 60 seconds for routing convergence (NLSR/DV)...")
-    time.sleep(60)
+    print("\nWaiting 45 seconds for routing convergence (NLSR/DV)...")
+    time.sleep(45)
     
     # Step 2: Start Producers
     print("=== Starting Producer Applications ===")

@@ -22,5 +22,5 @@ fw:
     websocket:
       enabled: false
   fw:
-    threads: 16
+    threads: 32
     strategy_node_name: pro9

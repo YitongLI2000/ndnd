@@ -22,8 +22,10 @@ import (
 	"github.com/named-data/ndnd/std/utils"
 )
 
+// TODO:debug, changed by yitong for testing
 // MaxFwThreads Maximum number of forwarding threads
-const MaxFwThreads = 32
+// const MaxFwThreads = 32
+const MaxFwThreads = 64
 
 // Threads contains all forwarding threads
 var Threads []*Thread

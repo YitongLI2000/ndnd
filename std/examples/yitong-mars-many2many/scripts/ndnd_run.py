@@ -320,8 +320,8 @@ def run_applications(net):
     logs_dir = os.path.join(script_dir, '..', 'logs')
     
     # Step 1 (Cont.): Wait for convergence
-    print("\nWaiting 60 seconds for routing convergence (NLSR/DV)...")
-    time.sleep(60)
+    print("\nWaiting 45 seconds for routing convergence (NLSR/DV)...")
+    time.sleep(45)
     
     # Step 2: Start Producers (0 to 24)
     print("=== Starting 25 Producer Applications ===")
@@ -337,8 +337,8 @@ def run_applications(net):
         p_node.cmd(f'{p_bin} {app_name} {prefix} > {p_log} 2>&1 &')
         time.sleep(0.1)
 
-    print("Waiting 10s for producers to register prefixes...")
-    time.sleep(10)
+    print("Waiting 5s for producers to register prefixes...")
+    time.sleep(5)
 
     # Step 3: Dynamic Route Configuration for all consumers
     configure_dynamic_routing(net)
