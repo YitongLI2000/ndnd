@@ -12,7 +12,7 @@ import collections
 
 # --- Configuration ---
 # Loss rate in percentage (0 to 100). 
-CON_TO_CORE_LOSS = 0
+CON_TO_CORE_LOSS = 0.1
 
 # Start delay for each consumer (in seconds) relative to the start of the consumer phase
 CONSUMER_START_DELAYS = {

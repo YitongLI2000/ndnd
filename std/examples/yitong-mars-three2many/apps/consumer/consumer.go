@@ -18,15 +18,15 @@ import (
 )
 
 const (
-	INIT_INTEREST_RATE    = 4000.0                // Initial Rate: 5000 interests/sec
-	TOTAL_DURATION        = 30 * time.Second      // Max duration (hard stop)
-	MAX_PACKETS           = 30000                 // Target packets to receive per flow
-	INTEREST_LIFETIME     = 4 * time.Second       // Individual Interest lifetime
-	RTT_WINDOW_DURATION   = 1 * time.Second       // Duration to keep RTT samples for RTO
-	MIN_RTO               = 30.0                  // Minimum RTO in milliseconds
-	MAX_RTO               = 100.0                 // Maximum RTO in milliseconds (Cap)
-	THROUGHPUT_WINDOW_DUR = 60 * time.Millisecond // Sliding window size for throughput/RTT
-	CHECK_INTERVAL        = 10 * time.Millisecond // Retransmission check interval (Lowered for tighter control)
+	INIT_INTEREST_RATE    = 4000.0                 // Initial Rate: 5000 interests/sec
+	TOTAL_DURATION        = 30 * time.Second       // Max duration (hard stop)
+	MAX_PACKETS           = 30000                  // Target packets to receive per flow
+	INTEREST_LIFETIME     = 4 * time.Second        // Individual Interest lifetime
+	RTT_WINDOW_DURATION   = 1 * time.Second        // Duration to keep RTT samples for RTO
+	MIN_RTO               = 30.0                   // Minimum RTO in milliseconds
+	MAX_RTO               = 100.0                  // Maximum RTO in milliseconds (Cap)
+	THROUGHPUT_WINDOW_DUR = 100 * time.Millisecond // Sliding window size for throughput/RTT
+	CHECK_INTERVAL        = 10 * time.Millisecond  // Retransmission check interval (Lowered for tighter control)
 )
 
 // Create a tag for our consumer application
