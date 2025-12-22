@@ -66,7 +66,7 @@ func (dp *DataPacket) Serialize() ([]byte, error) {
 }
 
 // Deserialize converts byte array back to DataPacket
-func DeserializeDataPacket(data []byte) (*DataPacket, error) {
+func Deserialize(data []byte) (*DataPacket, error) {
 	expectedSize := 8 + 8 + (150 * 8) // InterestQsf + DataQsf + 150 values
 	if len(data) != expectedSize {
 		return nil, fmt.Errorf("invalid data size: expected %d bytes, got %d", expectedSize, len(data))

@@ -14,6 +14,7 @@ import (
 	"github.com/named-data/ndnd/fw/core"
 	"github.com/named-data/ndnd/fw/defn"
 	"github.com/named-data/ndnd/fw/table"
+	enc "github.com/named-data/ndnd/std/encoding"
 )
 
 // BestRouteSuppressionTime is the time to suppress retransmissions of the same Interest.
@@ -53,6 +54,15 @@ func (s *BestRoute) AfterReceiveData(
 	inFace uint64,
 ) {
 	core.Log.Trace(s, "AfterReceiveData", "name", packet.Name, "inrecords", len(pitEntry.InRecords()))
+
+	// Extract sequence number from data name and log every 200 packets
+	dataName := packet.Name.String()
+	seqNum := extractSeqNum(dataName)
+	if seqNum >= 0 && seqNum%200 == 0 {
+		prefixKey := getPrefixKey(packet.Name)
+		core.Log.Debug(s, "Data packet logged", "name", packet.Name, "prefix", prefixKey, "seq", seqNum)
+	}
+
 	for faceID := range pitEntry.InRecords() {
 		core.Log.Trace(s, "Forwarding Data", "name", packet.Name, "faceid", faceID)
 		s.SendData(packet, pitEntry, faceID, inFace)
@@ -66,8 +76,17 @@ func (s *BestRoute) AfterReceiveInterest(
 	inFace uint64,
 	nexthops []*table.FibNextHopEntry,
 ) {
+	// Extract sequence number from interest name and log every 200 packets
+	interestName := packet.Name.String()
+	seqNum := extractSeqNum(interestName)
+	if seqNum >= 0 && seqNum%200 == 0 {
+		prefixKey := getPrefixKey(packet.Name)
+		core.Log.Debug(s, "Interest packet logged", "name", packet.Name, "prefix", prefixKey, "seq", seqNum)
+	}
+
 	if len(nexthops) == 0 {
-		core.Log.Debug(s, "No nexthop found - DROP", "name", packet.Name)
+		// core.Log.Debug(s, "No nexthop found - DROP", "name", packet.Name)
+		core.Log.Trace(s, "No nexthop found - DROP", "name", packet.Name)
 		return
 	}
 
@@ -96,7 +115,8 @@ func (s *BestRoute) AfterReceiveInterest(
 				if oR := pitEntry.OutRecords()[nh.Nexthop]; oR != nil {
 					// Suppress retransmissions of the same Interest within suppression time
 					if oR.LatestTimestamp.Add(BestRouteSuppressionTime).After(now) {
-						core.Log.Debug(s, "Suppressed Interest - DROP", "name", packet.Name)
+						// core.Log.Debug(s, "Suppressed Interest - DROP", "name", packet.Name)
+						core.Log.Trace(s, "Suppressed Interest - DROP", "name", packet.Name)
 						return
 					}
 
@@ -116,10 +136,20 @@ func (s *BestRoute) AfterReceiveInterest(
 		}
 	}
 
-	core.Log.Debug(s, "No usable nexthop for Interest - DROP", "name", packet.Name)
+	// core.Log.Debug(s, "No usable nexthop for Interest - DROP", "name", packet.Name)
+	core.Log.Trace(s, "No usable nexthop for Interest - DROP", "name", packet.Name)
 }
 
 // (AI GENERATED DESCRIPTION): No‑op; the BestRoute strategy performs no action before satisfying an Interest.
 func (s *BestRoute) BeforeSatisfyInterest(pitEntry table.PitEntry, inFace uint64) {
 	// This does nothing in BestRoute
+}
+
+// getPrefixKey extracts the prefix key from a packet name.
+// Uses the first component as the prefix key.
+func getPrefixKey(name enc.Name) string {
+	if len(name) > 0 {
+		return name[0].String()
+	}
+	return "/"
 }

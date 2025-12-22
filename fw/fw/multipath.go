@@ -10,6 +10,8 @@ package fw
 
 import (
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -40,6 +42,15 @@ func (s *Multipath) AfterContentStoreHit(packet *defn.Pkt, pitEntry table.PitEnt
 }
 
 func (s *Multipath) AfterReceiveData(packet *defn.Pkt, pitEntry table.PitEntry, inFace uint64) {
+	// Extract sequence number from data name and log every 200 packets
+	dataName := packet.Name.String()
+	seqNum := extractSeqNum(dataName)
+	if seqNum >= 0 && seqNum%200 == 0 {
+		core.Log.Info(s, "Data Forwarded",
+			"name", dataName,
+			"seq", seqNum)
+	}
+
 	for faceID := range pitEntry.InRecords() {
 		s.SendData(packet, pitEntry, faceID, inFace)
 	}
@@ -51,8 +62,14 @@ func (s *Multipath) AfterReceiveInterest(
 	inFace uint64,
 	nexthops []*table.FibNextHopEntry,
 ) {
-	// Log the incoming Interest
-	// core.Log.Info(s, "Processing Interest", "NDN forwarder: ", s.StrategyNodeName.String(), "Interest Name: ", packet.Name)
+	// Extract sequence number from interest name and log every 200 packets
+	interestName := packet.Name.String()
+	seqNum := extractSeqNum(interestName)
+	if seqNum >= 0 && seqNum%200 == 0 {
+		core.Log.Info(s, "Interest Forwarded",
+			"name", interestName,
+			"seq", seqNum)
+	}
 
 	if len(nexthops) == 0 {
 		core.Log.Warn(s, "No nexthops available for", packet.Name)
@@ -110,93 +127,23 @@ func (s *Multipath) AfterReceiveInterest(
 
 func (s *Multipath) BeforeSatisfyInterest(pitEntry table.PitEntry, inFace uint64) {}
 
-// /* Multipath Strategy - MARS project
-//  *
-//  * Implemented by Yitong, 2025.12.04
-//  * Modified for Round-Robin, 2025.12.04
-//  * Description: Round-Robin forwarding across all available nexthops.
-//  * No queues, no schedulers, fully thread-safe using atomic counters.
-//  */
-
-// package fw
-
-// import (
-// 	"sort"
-// 	"sync/atomic"
-
-// 	"github.com/named-data/ndnd/fw/core"
-// 	"github.com/named-data/ndnd/fw/defn"
-// 	"github.com/named-data/ndnd/fw/table"
-// )
-
-// type Multipath struct {
-// 	StrategyBase
-// 	// rrCounter is a global counter for this strategy instance.
-// 	// We use atomic operations to ensure thread safety if the strategy
-// 	// is shared across routines.
-// 	rrCounter uint64
-// }
-
-// func init() {
-// 	strategyInit = append(strategyInit, func() Strategy { return &Multipath{} })
-// 	StrategyVersions["multipath"] = []uint64{1}
-// }
-
-// func (s *Multipath) Instantiate(fwThread *Thread) {
-// 	s.NewStrategyBase(fwThread, "multipath", 1)
-// }
-
-// func (s *Multipath) AfterContentStoreHit(packet *defn.Pkt, pitEntry table.PitEntry, inFace uint64) {
-// 	s.SendData(packet, pitEntry, inFace, 0)
-// }
-
-// func (s *Multipath) AfterReceiveData(packet *defn.Pkt, pitEntry table.PitEntry, inFace uint64) {
-// 	for faceID := range pitEntry.InRecords() {
-// 		s.SendData(packet, pitEntry, faceID, inFace)
-// 	}
-// }
-
-// func (s *Multipath) AfterReceiveInterest(
-// 	packet *defn.Pkt,
-// 	pitEntry table.PitEntry,
-// 	inFace uint64,
-// 	nexthops []*table.FibNextHopEntry,
-// ) {
-// 	// Log the incoming Interest
-// 	// core.Log.Info(s, "Processing Interest", "NDN forwarder: ", s.StrategyNodeName.String(), "Interest Name: ", packet.Name)
-
-// 	if len(nexthops) == 0 {
-// 		core.Log.Warn(s, "No nexthops available for", packet.Name)
-// 		return
-// 	}
-
-// 	// 1. Sort Nexthops to ensure deterministic order for the Round-Robin.
-// 	// Without sorting, the order of nexthops might fluctuate, making RR behave randomly.
-// 	sortedHops := make([]*table.FibNextHopEntry, len(nexthops))
-// 	copy(sortedHops, nexthops)
-
-// 	sort.Slice(sortedHops, func(i, j int) bool {
-// 		return sortedHops[i].Nexthop < sortedHops[j].Nexthop
-// 	})
-
-// 	// 2. Atomic Round-Robin Selection
-// 	// We atomically increment the counter. The result is unique for this call.
-// 	// We subtract 1 because AddUint64 returns the new value, and we want 0-based indexing logic start.
-// 	currentCount := atomic.AddUint64(&s.rrCounter, 1) - 1
-
-// 	// Calculate index using Modulo
-// 	selectedIndex := currentCount % uint64(len(sortedHops))
-// 	targetFace := sortedHops[selectedIndex].Nexthop
-
-// 	// 3. Log the decision
-// 	// core.Log.Info(s, "Round-Robin Forwarding",
-// 	// 	"Name", packet.Name,
-// 	// 	"Total_Hops", len(sortedHops),
-// 	// 	"Selected_Index", selectedIndex,
-// 	// 	"Target_Face", targetFace)
-
-// 	// 4. Send Immediately
-// 	s.SendInterest(packet, pitEntry, targetFace, inFace)
-// }
-
-// func (s *Multipath) BeforeSatisfyInterest(pitEntry table.PitEntry, inFace uint64) {}
+// extractSeqNum extracts the sequence number from a name string.
+// Expected format: /prefix/node/[pd/<index>/|dt/]seq-<num>
+// Returns -1 if parsing fails.
+func extractSeqNum(nameStr string) int {
+	parts := strings.Split(nameStr, "/")
+	if len(parts) == 0 {
+		return -1
+	}
+	// Last component should be "seq-N"
+	lastPart := parts[len(parts)-1]
+	if !strings.HasPrefix(lastPart, "seq-") {
+		return -1
+	}
+	seqStr := strings.TrimPrefix(lastPart, "seq-")
+	seqNum, err := strconv.Atoi(seqStr)
+	if err != nil {
+		return -1
+	}
+	return seqNum
+}

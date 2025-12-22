@@ -175,8 +175,9 @@ func DefaultConfig() *Config {
 
 	//TODO: added by Yitong
 	c.Fw.StrategyNodeName = ""
-
 	c.Core.LogLevel = "INFO"
+	// c.Core.LogLevel = "DEBUG"
+
 	c.Core.LogFile = ""
 
 	c.Core.BaseDir = ""

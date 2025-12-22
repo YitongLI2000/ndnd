@@ -232,13 +232,14 @@ func (t *Thread) processIncomingInterest(packet *defn.Pkt) {
 
 	// Drop packet if no nonce is found
 	if !interest.NonceV.IsSet() {
-		core.Log.Debug(t, "Interest is missing Nonce", "name", packet.Name)
+
+		core.Log.Trace(t, "Interest has no nonce - DROP", "name", packet.Name)
 		return
 	}
 
 	// Check if packet is in dead nonce list
 	if exists := t.deadNonceList.Find(interest.NameV, interest.NonceV.Unwrap()); exists {
-		core.Log.Debug(t, "Interest is looping (DNL)", "name", packet.Name, "nonce", interest.NonceV.Unwrap())
+		core.Log.Trace(t, "Interest is looping (DNL)", "name", packet.Name, "nonce", interest.NonceV.Unwrap())
 		return
 	}
 
@@ -247,7 +248,7 @@ func (t *Thread) processIncomingInterest(packet *defn.Pkt) {
 	pitEntry, isDuplicate := t.pitCS.InsertInterest(interest, fhName, incomingFace.FaceID())
 	if isDuplicate {
 		// Interest loop - since we don't use Nacks, just drop
-		core.Log.Debug(t, "Interest is looping (PIT)", "name", packet.Name)
+		core.Log.Trace(t, "Interest is looping (PIT)", "name", packet.Name)
 		return
 	}
 
@@ -380,14 +381,14 @@ func (t *Thread) processOutgoingInterest(
 		return false
 	}
 	if outgoingFace.FaceID() == inFace && outgoingFace.LinkType() != defn.AdHoc {
-		core.Log.Debug(t, "Prevent send Interest back to incoming face", "name", packet.Name, "faceid", nexthop)
+		core.Log.Trace(t, "Prevent send Interest back to incoming face", "name", packet.Name, "faceid", nexthop)
 		return false
 	}
 
 	// Drop if HopLimit (if present) on Interest going to non-local face is 0. If so, drop
 	if interest.HopLimitV != nil && int(*interest.HopLimitV) == 0 &&
 		outgoingFace.Scope() == defn.NonLocal {
-		core.Log.Debug(t, "Prevent send Interest with HopLimit=0 to non-local face", "name", packet.Name, "faceid", nexthop)
+		core.Log.Trace(t, "Prevent send Interest with HopLimit=0 to non-local face", "name", packet.Name, "faceid", nexthop)
 		return false
 	}
 
@@ -464,7 +465,7 @@ func (t *Thread) processIncomingData(packet *defn.Pkt) {
 	pitEntries := t.pitCS.FindInterestPrefixMatchByDataEnc(data, pitToken)
 	if len(pitEntries) == 0 {
 		// Unsolicited Data - nothing more to do
-		core.Log.Debug(t, "Unsolicited data", "name", packet.Name, "faceid", packet.IncomingFaceID)
+		core.Log.Trace(t, "Unsolicited data", "name", packet.Name, "faceid", packet.IncomingFaceID)
 		return
 	}
 

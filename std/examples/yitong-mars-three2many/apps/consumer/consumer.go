@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/heap"
 	"fmt"
 	"math"
 	"os"
@@ -17,215 +18,341 @@ import (
 	"github.com/named-data/ndnd/std/utils"
 )
 
+// TODO: 50Mbps setup
 const (
-	INIT_INTEREST_RATE    = 4000.0                 // Initial Rate: 5000 interests/sec
-	TOTAL_DURATION        = 30 * time.Second       // Max duration (hard stop)
-	MAX_PACKETS           = 30000                  // Target packets to receive per flow
-	INTEREST_LIFETIME     = 4 * time.Second        // Individual Interest lifetime
-	RTT_WINDOW_DURATION   = 1 * time.Second        // Duration to keep RTT samples for RTO
-	MIN_RTO               = 30.0                   // Minimum RTO in milliseconds
-	MAX_RTO               = 100.0                  // Maximum RTO in milliseconds (Cap)
-	THROUGHPUT_WINDOW_DUR = 100 * time.Millisecond // Sliding window size for throughput/RTT
-	CHECK_INTERVAL        = 10 * time.Millisecond  // Retransmission check interval (Lowered for tighter control)
+	INIT_INTEREST_RATE    = 3000.0                // Initial Rate: interests/sec
+	TOTAL_DURATION        = 30 * time.Second      // Max duration
+	MAX_PACKETS           = 15000                 // Target packets per flow
+	INTEREST_LIFETIME     = 4 * time.Second       // Interest lifetime
+	RTT_WINDOW_DURATION   = 1 * time.Second       // RTT sample window
+	MIN_RTO               = 60.0                  // Min RTO (ms)
+	MAX_RTO               = 600.0                 // Max RTO (ms)
+	THROUGHPUT_WINDOW_DUR = 20 * time.Millisecond // Sliding window size
+	TICKER_INTERVAL       = 1 * time.Millisecond  // Granularity for Token Bucket
 )
 
 // Create a tag for our consumer application
 type ConsumerTag struct{}
 
-func (ConsumerTag) String() string {
-	return "NDN-Consumer"
-}
+func (ConsumerTag) String() string { return "NDN-Consumer" }
 
 var consumerTag = ConsumerTag{}
 
-// PacketSample helps track throughput and RTT in the sliding window
+type TransmissionMode int
+
+const (
+	ModePD TransmissionMode = iota
+	ModeDT
+)
+
+var selectedMode = ModePD
+var consumerNodeName string
+
+// PacketSample for throughput calculation
 type PacketSample struct {
 	Timestamp time.Time
 	Size      int
-	RTT       float64 // in milliseconds
+	RTT       float64
 }
 
-// FlowContext holds state specific to a single flow (target prefix)
+// RTTSample for RTO calculation
+type RTTSample struct {
+	Timestamp time.Time
+	RTT       float64
+}
+
+// --- OPTIMIZATION C: Decentralized RTT Tracking ---
+// RTT logic is moved inside FlowContext to avoid global lock contention.
+
 type FlowContext struct {
 	mu     sync.Mutex
 	Prefix string
 
-	// Statistics
+	// Pre-computed base name components to save allocations (Optimization D)
+	baseName enc.Name
+
+	// Path Discovery
+	PdIndex    int
+	PdFinished bool
+
+	// General Stats
 	totalBytes        int64
-	pktsReceivedTotal int // Total valid Data packets received
+	pktsReceivedTotal int
 	startTime         time.Time
 	endTime           time.Time
 	isFinished        bool
-	doneCh            chan struct{} // Signal channel when MAX_PACKETS reached
+	doneCh            chan struct{}
 
-	// Unified Sliding Window (100ms)
-	window []PacketSample
+	// Rate Control / Throughput Window
+	window           []PacketSample
+	currentRate      float64
+	pktsCalibrated   int
+	initialRTTSum    float64
+	baseRTT          float64
+	adjustmentPeriod time.Duration
+	lastRateUpdate   time.Time
 
-	// Rate Control State
-	currentRate      float64       // Interests per second
-	pktsCalibrated   int           // Count for initial calibration (distinct from total)
-	initialRTTSum    float64       // Sum of first 5 RTTs
-	baseRTT          float64       // Average of first 5 RTTs (Baseline)
-	adjustmentPeriod time.Duration // Calculated from first 5 packets
-	lastRateUpdate   time.Time     // Last time we adjusted the rate
+	// New Field: Track actual sends for interval logging
+	interestsSentInPeriod int
+
+	// --- RTT / RTO State (Per-Flow) ---
+	rttHistory []RTTSample
+	srtt       float64
+	rttVar     float64
+	rto        float64
+
+	// Map to track send times for RTT calculation within this flow
+	pendingSends map[string]time.Time
 }
 
 func NewFlowContext(prefix string) *FlowContext {
 	now := time.Now()
+
+	// Pre-compute base name: /<prefix>/<node>/[pd/0 | dt]
+	// This avoids parsing the prefix string for every packet.
+	n, _ := enc.NameFromStr(prefix)
+	if consumerNodeName != "" {
+		n = n.Append(enc.NewStringComponent(0x08, consumerNodeName))
+	}
+
+	if selectedMode == ModePD {
+		n = n.Append(enc.NewStringComponent(0x08, "pd"))
+		n = n.Append(enc.NewStringComponent(0x08, "0")) // Default index 0
+	} else {
+		n = n.Append(enc.NewStringComponent(0x08, "dt"))
+	}
+
 	return &FlowContext{
-		Prefix:         prefix,
-		startTime:      now,
-		endTime:        now,
-		window:         make([]PacketSample, 0),
-		currentRate:    INIT_INTEREST_RATE,
-		pktsCalibrated: 0,
-		lastRateUpdate: now,
-		doneCh:         make(chan struct{}),
+		Prefix:                prefix,
+		baseName:              n,
+		PdIndex:               0,
+		startTime:             now,
+		endTime:               now,
+		window:                make([]PacketSample, 0),
+		currentRate:           INIT_INTEREST_RATE,
+		pktsCalibrated:        0,
+		lastRateUpdate:        now,
+		doneCh:                make(chan struct{}),
+		interestsSentInPeriod: 0,
+
+		// RTT Init
+		rttHistory:   make([]RTTSample, 0),
+		srtt:         0,
+		rttVar:       0,
+		rto:          MIN_RTO * 2,
+		pendingSends: make(map[string]time.Time),
 	}
 }
 
-// GetRate returns the current dynamic sending rate
 func (f *FlowContext) GetRate() float64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.currentRate
 }
 
-// RecordPacket updates window, stats, and adjusts sending rate based on RTT congestion control
-func (f *FlowContext) RecordPacket(payloadSize int, rttVal float64) {
+func (f *FlowContext) GetRTO() float64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rto
+}
+
+// RecordInterestSend stores timestamp for RTT calc
+func (f *FlowContext) RecordInterestSend(name string, t time.Time) {
+	f.mu.Lock()
+	f.pendingSends[name] = t
+	// Track actual sends for the interval log
+	f.interestsSentInPeriod++
+	f.mu.Unlock()
+}
+
+// RecordPacket handles both RTT calculation and Rate Adaptation
+func (f *FlowContext) RecordPacket(payloadSize int, dataName string, receiveTime time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	now := time.Now()
+	// --- 1. RTT Calculation Logic (Moved from global tracker) ---
+	sendTime, ok := f.pendingSends[dataName]
+	if !ok {
+		// Might be a duplicate or timed out already
+		return
+	}
+	delete(f.pendingSends, dataName) // Clean up
 
-	// Only update stats if we haven't finished yet to prevent skewing stats after completion
+	rttVal := float64(receiveTime.Sub(sendTime).Nanoseconds()) / 1e6
+
+	// Log data received every 200 packets (per prefix)
+	seqNum := extractSeqNum(dataName)
+	if seqNum >= 0 && seqNum%200 == 0 {
+		log.Debug(consumerTag, "Data Received",
+			"name", dataName,
+			"rtt", rttVal)
+	}
+
+	// Update RTT History Window
+	f.rttHistory = append(f.rttHistory, RTTSample{Timestamp: receiveTime, RTT: rttVal})
+
+	// Prune old RTT samples
+	validIdx := 0
+	for i, s := range f.rttHistory {
+		if receiveTime.Sub(s.Timestamp) <= RTT_WINDOW_DURATION {
+			validIdx = i
+			break
+		}
+	}
+	f.rttHistory = f.rttHistory[validIdx:]
+
+	// Calculate RTO (Equations)
+	count := len(f.rttHistory)
+	var meanRTT, variance, calculatedRTO, finalRTO float64
+
+	if count < 2 {
+		meanRTT = rttVal
+		variance = 0.0
+		calculatedRTO = math.Max(MIN_RTO, 2*rttVal)
+		finalRTO = 3 * calculatedRTO
+	} else {
+		var sum float64
+		for _, s := range f.rttHistory {
+			sum += s.RTT
+		}
+		meanRTT = sum / float64(count)
+
+		var varSum float64
+		for _, s := range f.rttHistory {
+			diff := s.RTT - meanRTT
+			varSum += diff * diff
+		}
+		variance = varSum / float64(count)
+
+		stdDev := math.Sqrt(variance)
+		calculatedRTO = meanRTT + 4*stdDev
+		finalRTO = 3 * calculatedRTO
+	}
+
+	if finalRTO < MIN_RTO {
+		finalRTO = MIN_RTO
+	}
+	if finalRTO > MAX_RTO {
+		finalRTO = MAX_RTO
+	}
+
+	f.srtt = meanRTT
+	f.rttVar = variance
+	f.rto = finalRTO
+
+	// --- 2. Stats & Rate Control ---
+
 	if f.isFinished {
 		return
 	}
 
-	f.endTime = now
+	f.endTime = receiveTime
 	f.totalBytes += int64(payloadSize)
 	f.pktsReceivedTotal++
 
-	// Check for completion
 	if f.pktsReceivedTotal >= MAX_PACKETS {
 		f.isFinished = true
 		close(f.doneCh)
 	}
 
-	// 1. Update Sliding Window (Add new, remove old > 100ms)
-	f.window = append(f.window, PacketSample{
-		Timestamp: now,
-		Size:      payloadSize,
-		RTT:       rttVal,
-	})
-
-	cutoff := now.Add(-THROUGHPUT_WINDOW_DUR)
-	validIdx := 0
-	for i, sample := range f.window {
-		if sample.Timestamp.After(cutoff) {
-			validIdx = i
+	// Update Throughput Window
+	f.window = append(f.window, PacketSample{Timestamp: receiveTime, Size: payloadSize, RTT: rttVal})
+	cutoff := receiveTime.Add(-THROUGHPUT_WINDOW_DUR)
+	validWinIdx := 0
+	for i, s := range f.window {
+		if s.Timestamp.After(cutoff) {
+			validWinIdx = i
 			break
 		}
 	}
-	// Prune the slice
-	f.window = f.window[validIdx:]
+	f.window = f.window[validWinIdx:]
 
-	// 2. Initial Adjustment Period Calculation (First 5 packets)
+	// Calibration & Dynamic Rate (Same logic as original, just integrated)
 	if f.pktsCalibrated < 5 {
 		f.initialRTTSum += rttVal
 		f.pktsCalibrated++
-
 		if f.pktsCalibrated == 5 {
-			// Calculate Base RTT
 			f.baseRTT = f.initialRTTSum / 5.0
-
-			// Calculate adjustment period based on sum of first 5 RTTs
 			f.adjustmentPeriod = time.Duration(f.initialRTTSum) * time.Millisecond
-
-			// Safety lower bound for adjustment period
 			if f.adjustmentPeriod < 20*time.Millisecond {
 				f.adjustmentPeriod = 20 * time.Millisecond
 			}
-
-			f.lastRateUpdate = now
-			log.Info(consumerTag, "Flow Calibration Complete",
-				"flow", f.Prefix,
-				"baseRTT", f.baseRTT,
-				"period", f.adjustmentPeriod)
+			f.lastRateUpdate = receiveTime
+			// Reset counter for the first real interval
+			f.interestsSentInPeriod = 0
+			log.Info(consumerTag, "Flow Calibration Complete", "flow", f.Prefix, "baseRTT", f.baseRTT)
 		}
-		return // Don't adjust rate yet
+		return
 	}
 
-	// 3. Dynamic Rate Adjustment
-	if now.Sub(f.lastRateUpdate) >= f.adjustmentPeriod {
+	timeSinceLastUpdate := receiveTime.Sub(f.lastRateUpdate)
 
-		// Calculate Window Statistics
-		var totalRTT float64
-		count := len(f.window)
+	if timeSinceLastUpdate >= f.adjustmentPeriod {
+		// --- LOGGING UPDATE: Calculate Actual Rate vs Target Rate ---
+		actualRate := 0.0
+		if timeSinceLastUpdate.Seconds() > 0 {
+			actualRate = float64(f.interestsSentInPeriod) / timeSinceLastUpdate.Seconds()
+		}
 
-		if count == 0 {
+		// Simple congestion control logic
+		var totalWinRTT float64
+		wCount := len(f.window)
+		if wCount == 0 {
 			return
 		}
 
 		for _, s := range f.window {
-			totalRTT += s.RTT
+			totalWinRTT += s.RTT
 		}
-		windowAvgRTT := totalRTT / float64(count)
+		avgWinRTT := totalWinRTT / float64(wCount)
+		measuredPPS := float64(wCount) / THROUGHPUT_WINDOW_DUR.Seconds()
 
-		// Calculate Throughput (PPS)
-		windowSeconds := THROUGHPUT_WINDOW_DUR.Seconds()
-		measuredThroughputPPS := float64(count) / windowSeconds
-
-		// Determine Target Rate based on RTT comparison
 		targetRate := f.currentRate
-
-		if windowAvgRTT < 3*f.baseRTT {
-			// Low congestion: Probe more bandwidth
-			targetRate = f.currentRate * 1.1
-		} else if windowAvgRTT >= 3*f.baseRTT && windowAvgRTT < 4.5*f.baseRTT {
-			// Moderate congestion: Hold rate
+		if avgWinRTT < 3*f.baseRTT {
+			targetRate = f.currentRate * 1.05
+		} else if avgWinRTT >= 3*f.baseRTT && avgWinRTT < 6*f.baseRTT {
 			targetRate = f.currentRate
 		} else {
-			// High congestion (>= 2 * base): Back off
-			targetRate = f.currentRate * 0.8
+			targetRate = f.currentRate * 0.95
 		}
 
-		// Apply Throughput Caps
-		lowerBound := 0.8 * measuredThroughputPPS
-		upperBound := 2.0 * measuredThroughputPPS
-
-		if lowerBound < 1.0 {
-			lowerBound = 1.0
+		// Caps
+		lower := 0.8 * measuredPPS
+		if lower < 1.0 {
+			lower = 1.0
 		}
-		if upperBound < INIT_INTEREST_RATE {
-			upperBound = INIT_INTEREST_RATE
-		}
-
-		finalRate := targetRate
-
-		if finalRate < lowerBound {
-			finalRate = lowerBound
-		}
-		if finalRate > upperBound {
-			finalRate = upperBound
+		upper := 1.75 * measuredPPS
+		if upper < INIT_INTEREST_RATE {
+			upper = INIT_INTEREST_RATE
 		}
 
-		if finalRate < 10.0 {
-			finalRate = 10.0
+		if targetRate < lower {
+			targetRate = lower
+		}
+		if targetRate > upper {
+			targetRate = upper
+		}
+		if targetRate < 10.0 {
+			targetRate = 10.0
 		}
 
-		prevRate := f.currentRate
-		f.currentRate = finalRate
-		f.lastRateUpdate = now
+		oldRate := f.currentRate
+		f.currentRate = targetRate
+		f.lastRateUpdate = receiveTime
 
-		log.Info(consumerTag, "Rate Adjusted",
-			"flow", f.Prefix,
+		// Log rate adjustment with Actual vs Theoretical
+		log.Debug(consumerTag, "Rate Adjusted",
+			"prefix", f.Prefix,
+			"oldTargetRate", oldRate,
+			"newTargetRate", f.currentRate,
+			"actualRate", actualRate, // The real rate achieved on wire
+			// "sentCount", f.interestsSentInPeriod,
+			// "intervalMs", timeSinceLastUpdate.Milliseconds(),
 			"baseRTT", f.baseRTT,
-			"winAvgRTT", windowAvgRTT,
-			"measuredPPS", measuredThroughputPPS,
-			"oldRate", prevRate,
-			"finalRate", f.currentRate)
+			"latestRTT", avgWinRTT)
+
+		// Reset the counter for the next interval
+		f.interestsSentInPeriod = 0
 	}
 }
 
@@ -236,179 +363,11 @@ func (f *FlowContext) GetFinalStats() (float64, int64, float64) {
 	if duration <= 0 {
 		return 0.0, f.totalBytes, 0.0
 	}
-	// Change to Mbps: (Bytes * 8) / (Seconds * 1,000,000)
-	throughputMbps := (float64(f.totalBytes) * 8.0) / (duration * 1000000.0)
+	throughputMbps := (float64(f.totalBytes) * 8.0) / (duration * 1e6)
 	return throughputMbps, f.totalBytes, duration
 }
 
-// RTTSample holds a single RTT measurement
-type RTTSample struct {
-	Timestamp time.Time
-	RTT       float64 // in milliseconds
-}
-
-// RTTTracker structure
-type RTTTracker struct {
-	mu               sync.RWMutex
-	pendingInterests map[string]time.Time // interest name -> send time
-
-	// Per-prefix history for RTO calculation
-	rttHistory map[string][]RTTSample
-
-	// Current calculated metrics per prefix
-	srtt   map[string]float64 // Stores the Mean RTT (Equation 1)
-	rttVar map[string]float64 // Stores the Variance (Equation 2)
-	rto    map[string]float64 // Stores the Final Threshold (Equation 4)
-
-	totalSamples int
-	totalRTT     float64
-}
-
-func NewRTTTracker() *RTTTracker {
-	return &RTTTracker{
-		pendingInterests: make(map[string]time.Time),
-		rttHistory:       make(map[string][]RTTSample),
-		srtt:             make(map[string]float64),
-		rttVar:           make(map[string]float64),
-		rto:              make(map[string]float64),
-		totalSamples:     0,
-		totalRTT:         0,
-	}
-}
-
-// GetRTO returns the current RTO for a prefix, or a default value if unknown
-func (rtt *RTTTracker) GetRTO(prefix string) float64 {
-	rtt.mu.RLock()
-	defer rtt.mu.RUnlock()
-	if val, ok := rtt.rto[prefix]; ok {
-		return val
-	}
-	return MIN_RTO * 2 // Default conservative RTO
-}
-
-func (rtt *RTTTracker) RecordInterestSent(interestName string, prefix string, sendTime time.Time) {
-	rtt.mu.Lock()
-	defer rtt.mu.Unlock()
-	// Overwrite any existing timestamp.
-	// This resets the RTT timer for this specific interest name (Sequence Number).
-	rtt.pendingInterests[interestName] = sendTime
-
-	if _, exists := rtt.rttHistory[prefix]; !exists {
-		rtt.rttHistory[prefix] = make([]RTTSample, 0)
-		rtt.srtt[prefix] = 0
-		rtt.rttVar[prefix] = 0
-		rtt.rto[prefix] = MIN_RTO * 2
-	}
-}
-
-// RecordDataReceived calculates RTO based on the provided 4 equations.
-func (rtt *RTTTracker) RecordDataReceived(dataName string, prefix string, receiveTime time.Time) (float64, float64, float64, float64) {
-	rtt.mu.Lock()
-	defer rtt.mu.Unlock()
-
-	sendTime, exists := rtt.pendingInterests[dataName]
-	if !exists {
-		return 0, 0, 0, 0
-	}
-
-	rttSampleVal := float64(receiveTime.Sub(sendTime).Nanoseconds()) / 1e6
-
-	rtt.totalSamples++
-	rtt.totalRTT += rttSampleVal
-	delete(rtt.pendingInterests, dataName)
-
-	// Update History Window
-	newSample := RTTSample{Timestamp: receiveTime, RTT: rttSampleVal}
-	rtt.rttHistory[prefix] = append(rtt.rttHistory[prefix], newSample)
-
-	// Remove samples older than window duration
-	history := rtt.rttHistory[prefix]
-	validIdx := 0
-	for i, sample := range history {
-		if receiveTime.Sub(sample.Timestamp) <= RTT_WINDOW_DURATION {
-			validIdx = i
-			break
-		}
-	}
-	rtt.rttHistory[prefix] = history[validIdx:]
-	history = rtt.rttHistory[prefix]
-
-	// --- RTO Calculation (Equations 1, 2, 3, 4) ---
-
-	var meanRTT, variance, calculatedRTO, finalRTO float64
-
-	if len(history) < 2 {
-		// Not enough samples for variance.
-		meanRTT = rttSampleVal
-		variance = 0.0
-		calculatedRTO = math.Max(MIN_RTO, 2*rttSampleVal)
-		finalRTO = 3 * calculatedRTO
-	} else {
-		// Equation 1: Sample Mean RTT
-		var sum float64
-		for _, s := range history {
-			sum += s.RTT
-		}
-		meanRTT = sum / float64(len(history))
-
-		// Equation 2: Sample Variance
-		var varSum float64
-		for _, s := range history {
-			diff := s.RTT - meanRTT
-			varSum += diff * diff
-		}
-		variance = varSum / float64(len(history))
-
-		// Equation 3: RTO = Mean + 4 * sqrt(Variance)
-		stdDev := math.Sqrt(variance)
-		calculatedRTO = meanRTT + 4*stdDev
-
-		// Equation 4: RTO_threshold = 3 * RTO_final
-		finalRTO = 3 * calculatedRTO
-	}
-
-	// Apply Constraints to Final RTO
-	if finalRTO < MIN_RTO {
-		finalRTO = MIN_RTO
-	}
-	if finalRTO > MAX_RTO {
-		finalRTO = MAX_RTO
-	}
-
-	// Update State
-	rtt.srtt[prefix] = meanRTT
-	rtt.rttVar[prefix] = variance
-	rtt.rto[prefix] = finalRTO
-
-	return rttSampleVal, meanRTT, variance, finalRTO
-}
-
-func (rtt *RTTTracker) RecordInterestTimeout(interestName string) {
-	rtt.mu.Lock()
-	defer rtt.mu.Unlock()
-	delete(rtt.pendingInterests, interestName)
-}
-
-func (rtt *RTTTracker) PrintStats() {
-	rtt.mu.RLock()
-	defer rtt.mu.RUnlock()
-
-	var avgRTT float64
-	if rtt.totalSamples > 0 {
-		avgRTT = rtt.totalRTT / float64(rtt.totalSamples)
-	}
-
-	log.Info(consumerTag, "=== RTT Statistics ===")
-	log.Info(consumerTag, "Global RTT Stats", "avgRTT", avgRTT, "samples", rtt.totalSamples)
-
-	for prefix, val := range rtt.srtt {
-		log.Info(consumerTag, "Per-Prefix RTO State",
-			"prefix", prefix,
-			"MeanRTT(SRTT)", val,
-			"Variance(RTTVAR)", rtt.rttVar[prefix],
-			"FinalThreshold(RTO)", rtt.rto[prefix])
-	}
-}
+// --- Statistics ---
 
 type Statistics struct {
 	mu              sync.Mutex
@@ -416,22 +375,19 @@ type Statistics struct {
 	dataReceived    int
 	nackReceived    int
 	timeoutReceived int
-	cancelReceived  int
 	retransmissions int
 }
 
-func (s *Statistics) IncrementSent()    { s.mu.Lock(); defer s.mu.Unlock(); s.totalSent++ }
-func (s *Statistics) IncrementData()    { s.mu.Lock(); defer s.mu.Unlock(); s.dataReceived++ }
-func (s *Statistics) IncrementNack()    { s.mu.Lock(); defer s.mu.Unlock(); s.nackReceived++ }
-func (s *Statistics) IncrementTimeout() { s.mu.Lock(); defer s.mu.Unlock(); s.timeoutReceived++ }
-func (s *Statistics) IncrementCancel()  { s.mu.Lock(); defer s.mu.Unlock(); s.cancelReceived++ }
-func (s *Statistics) IncrementRetx()    { s.mu.Lock(); defer s.mu.Unlock(); s.retransmissions++ }
+func (s *Statistics) IncrementSent()    { s.mu.Lock(); s.totalSent++; s.mu.Unlock() }
+func (s *Statistics) IncrementData()    { s.mu.Lock(); s.dataReceived++; s.mu.Unlock() }
+func (s *Statistics) IncrementNack()    { s.mu.Lock(); s.nackReceived++; s.mu.Unlock() }
+func (s *Statistics) IncrementTimeout() { s.mu.Lock(); s.timeoutReceived++; s.mu.Unlock() }
+func (s *Statistics) IncrementRetx()    { s.mu.Lock(); s.retransmissions++; s.mu.Unlock() }
 
 func (s *Statistics) Print() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	log.Info(consumerTag, "=== Final Statistics ===")
-	log.Info(consumerTag, "Summary",
+	log.Info(consumerTag, "=== Final Statistics ===",
 		"totalSent", s.totalSent,
 		"dataReceived", s.dataReceived,
 		"nackReceived", s.nackReceived,
@@ -439,63 +395,152 @@ func (s *Statistics) Print() {
 		"retransmissions", s.retransmissions)
 }
 
-var globalRTTTracker = NewRTTTracker()
-
-// --- Retransmission Logic ---
+// --- OPTIMIZATION E: Heap-based Retransmission Controller ---
 
 type PendingPacket struct {
 	Name        string
 	Prefix      string
-	SendTime    time.Time
+	Expiration  time.Time // Key for Heap
 	SequenceNum int
 	FlowCtx     *FlowContext
+	Index       int // For heap interface
+}
+
+// PacketHeap implements heap.Interface
+type PacketHeap []*PendingPacket
+
+func (h PacketHeap) Len() int           { return len(h) }
+func (h PacketHeap) Less(i, j int) bool { return h[i].Expiration.Before(h[j].Expiration) }
+func (h PacketHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].Index = i
+	h[j].Index = j
+}
+func (h *PacketHeap) Push(x interface{}) {
+	n := len(*h)
+	item := x.(*PendingPacket)
+	item.Index = n
+	*h = append(*h, item)
+}
+func (h *PacketHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil // Avoid memory leak
+	item.Index = -1
+	*h = old[0 : n-1]
+	return item
 }
 
 type RetransmissionController struct {
-	mu               sync.Mutex
-	pendingInterests map[string]PendingPacket // Key: Interest Name
-	app              ndn.Engine
-	stats            *Statistics
-	stopCh           chan struct{}
+	mu sync.Mutex
+	pq PacketHeap
+	// Map to track status. If missing from map, it means it was acked/cancelled.
+	// If present, it maps to the SequenceNum to verify validity (in case of seq wrapping, though unlikely here)
+	active   map[string]int
+	app      ndn.Engine
+	stats    *Statistics
+	stopCh   chan struct{}
+	wakeupCh chan struct{} // To wake up the scheduler loop when new item added
 }
 
 func NewRetransmissionController(app ndn.Engine, stats *Statistics) *RetransmissionController {
-	return &RetransmissionController{
-		pendingInterests: make(map[string]PendingPacket),
-		app:              app,
-		stats:            stats,
-		stopCh:           make(chan struct{}),
+	rc := &RetransmissionController{
+		pq:       make(PacketHeap, 0),
+		active:   make(map[string]int),
+		app:      app,
+		stats:    stats,
+		stopCh:   make(chan struct{}),
+		wakeupCh: make(chan struct{}, 1),
 	}
+	heap.Init(&rc.pq)
+	return rc
 }
 
 func (rc *RetransmissionController) Add(name string, prefix string, seq int, flowCtx *FlowContext) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	rc.pendingInterests[name] = PendingPacket{
+
+	// Calculate Expiration based on current Flow RTO
+	rto := flowCtx.GetRTO()
+	expiration := time.Now().Add(time.Duration(rto) * time.Millisecond)
+
+	pkt := &PendingPacket{
 		Name:        name,
 		Prefix:      prefix,
-		SendTime:    time.Now(),
+		Expiration:  expiration,
 		SequenceNum: seq,
 		FlowCtx:     flowCtx,
+	}
+
+	rc.active[name] = seq
+	heap.Push(&rc.pq, pkt)
+
+	// Non-blocking signal to wake up loop if this is the new earliest item
+	select {
+	case rc.wakeupCh <- struct{}{}:
+	default:
 	}
 }
 
 func (rc *RetransmissionController) Remove(name string) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	delete(rc.pendingInterests, name)
+	// Lazy removal: just delete from map.
+	// When the heap pops the item, we check the map. If missing, we ignore.
+	delete(rc.active, name)
 }
 
 func (rc *RetransmissionController) StartScheduler() {
-	ticker := time.NewTicker(CHECK_INTERVAL)
-	defer ticker.Stop()
-
 	for {
+		var waitDuration time.Duration
+
+		rc.mu.Lock()
+		if rc.pq.Len() == 0 {
+			waitDuration = 10 * time.Second // Idle wait
+		} else {
+			now := time.Now()
+			top := rc.pq[0]
+			if now.After(top.Expiration) {
+				// Expired! Pop and Process
+				item := heap.Pop(&rc.pq).(*PendingPacket)
+
+				// Check if still active
+				if seq, exists := rc.active[item.Name]; exists && seq == item.SequenceNum {
+					// Needs Retransmission
+					// Re-add to heap with NEW expiration
+					rto := item.FlowCtx.GetRTO()
+					item.Expiration = now.Add(time.Duration(rto) * time.Millisecond)
+					heap.Push(&rc.pq, item)
+
+					// Unlock before sending to avoid blocking
+					rc.mu.Unlock()
+
+					rc.stats.IncrementRetx()
+					// Synchronous send (on a separate goroutine is fine here as Retx is low freq compared to main flow)
+					// But to keep it lightweight, we just fire it.
+					go sendSingleInterest(rc.app, rc.stats, item.SequenceNum, item.FlowCtx, true)
+					continue // Loop again immediately
+				}
+				// Else: was removed/acked, ignore.
+				rc.mu.Unlock()
+				continue
+			} else {
+				// Not expired yet
+				waitDuration = top.Expiration.Sub(now)
+			}
+		}
+		rc.mu.Unlock()
+
 		select {
 		case <-rc.stopCh:
 			return
-		case <-ticker.C:
-			rc.checkTimeouts()
+		case <-rc.wakeupCh:
+			// New item added, re-evaluate heap
+			continue
+		case <-time.After(waitDuration):
+			// Timer expired, check heap
+			continue
 		}
 	}
 }
@@ -504,59 +549,232 @@ func (rc *RetransmissionController) Stop() {
 	close(rc.stopCh)
 }
 
-func (rc *RetransmissionController) checkTimeouts() {
-	rc.mu.Lock()
-	// We copy pending packets to a slice to avoid holding lock during retransmission
-	// However, for simplicity and thread-safety of the map, we can iterate and collect
-	// packets to retransmit, then retransmit them.
-	var toRetransmit []PendingPacket
-	now := time.Now()
+var globalRetxController *RetransmissionController
 
-	for _, pkt := range rc.pendingInterests {
-		// Get Dynamic RTO for this flow
-		rtoVal := globalRTTTracker.GetRTO(pkt.Prefix)
-		rtoDuration := time.Duration(rtoVal) * time.Millisecond
+// --- Sending Logic ---
 
-		if now.Sub(pkt.SendTime) > rtoDuration {
-			toRetransmit = append(toRetransmit, pkt)
-		}
+// sendSingleInterest is now optimized for allocations and called synchronously
+func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flowCtx *FlowContext, isRetransmission bool) {
+	// OPTIMIZATION D: Allocation Optimization
+	// Use pre-computed baseName. Append sequence number efficiently.
+	// Note: We need a copy because Append modifies the slice.
+	// Since enc.Name is essentially a slice of components, shallow copy is cheap,
+	// but appending requires new backing array usually.
+
+	// Create the sequence component string manually or efficiently
+	// Using strconv.AppendInt to a buffer to avoid fmt.Sprintf
+	// For simplicity in NDN lib usage, we create the component directly.
+
+	// We reconstruct name from base:
+	name := flowCtx.baseName.Append(enc.NewStringComponent(0x08, "seq-"+strconv.Itoa(sequenceNum)))
+
+	intCfg := &ndn.InterestConfig{
+		MustBeFresh: true,
+		Lifetime:    optional.Some(INTEREST_LIFETIME),
+		Nonce:       utils.ConvertNonce(app.Timer().Nonce()),
 	}
-	rc.mu.Unlock()
 
-	// Perform Retransmissions
-	for _, pkt := range toRetransmit {
-		// Update the timestamp in the map immediately to prevent double retransmission
-		// in the next tick if the network is very slow
-		rc.mu.Lock()
-		if _, exists := rc.pendingInterests[pkt.Name]; exists {
-			// Update send time
-			p := rc.pendingInterests[pkt.Name]
-			p.SendTime = time.Now()
-			rc.pendingInterests[pkt.Name] = p
-		} else {
-			// Packet might have been received/removed in the meantime
-			rc.mu.Unlock()
-			continue
+	interest, err := app.Spec().MakeInterest(name, intCfg, nil, nil)
+	if err != nil {
+		return
+	}
+
+	stats.IncrementSent()
+	interestName := interest.FinalName.String()
+	sendTime := time.Now()
+
+	// Log interest every 200 packets with current send rate
+	if sequenceNum%200 == 0 {
+		currentRate := flowCtx.GetRate()
+		log.Debug(consumerTag, "Interest Sent",
+			"name", interestName,
+			"rate", currentRate)
+	}
+
+	// Record send time for RTT (Local Flow Context)
+	flowCtx.RecordInterestSend(interestName, sendTime)
+
+	// Add to Heap Controller
+	globalRetxController.Add(interestName, flowCtx.Prefix, sequenceNum, flowCtx)
+
+	err = app.Express(interest,
+		func(args ndn.ExpressCallbackArgs) {
+			receiveTime := time.Now()
+			switch args.Result {
+			case ndn.InterestResultNack:
+				stats.IncrementNack()
+				globalRetxController.Remove(interestName)
+			case ndn.InterestResultTimeout:
+				stats.IncrementTimeout()
+				globalRetxController.Remove(interestName)
+			case ndn.InterestCancelled:
+				// stats.IncrementCancel()
+				globalRetxController.Remove(interestName)
+			case ndn.InterestResultData:
+				data := args.Data
+				content := data.Content().Join()
+				dataName := data.Name().String()
+
+				// Mark as received in Retx Controller (Lazy removal)
+				globalRetxController.Remove(dataName)
+
+				// Update Flow Stats & Rate (Decentralized)
+				flowCtx.RecordPacket(len(content), dataName, receiveTime)
+
+				stats.IncrementData()
+			}
+		})
+}
+
+// --- Main Flow Loop ---
+
+func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	totalTimer := time.NewTimer(TOTAL_DURATION)
+	defer totalTimer.Stop()
+
+	// OPTIMIZATION B: Token Bucket Pacing
+	// Instead of sleep(1/rate), we accumulate tokens.
+	ticker := time.NewTicker(TICKER_INTERVAL)
+	defer ticker.Stop()
+
+	tokens := 0.0
+	sequenceNum := 0
+
+	// Max burst allows sending a few packets back-to-back if we fell behind slightly,
+	// but prevents dumping huge spikes.
+	const MAX_BURST = 5.0
+
+	log.Info(consumerTag, "Starting flow", "target", flowCtx.Prefix)
+
+	for {
+		select {
+		case <-totalTimer.C:
+			return
+		case <-flowCtx.doneCh:
+			return
+		case <-ticker.C:
+			// Refill tokens based on current rate
+			// Rate is packets/sec. Ticker is TICKER_INTERVAL.
+			// tokens += rate * interval_in_seconds
+			currentRate := flowCtx.GetRate()
+			tokens += currentRate * TICKER_INTERVAL.Seconds()
+
+			if tokens > MAX_BURST {
+				tokens = MAX_BURST
+			}
+
+			// OPTIMIZATION A: Remove Per-Packet Goroutines
+			// We loop here and send synchronously while we have tokens.
+			// This keeps the goroutine count constant (N flows = N goroutines).
+			for tokens >= 1.0 {
+				if sequenceNum >= MAX_PACKETS {
+					// Wait for completion or timeout
+					tokens = 0
+					break
+				}
+
+				sequenceNum++
+				tokens -= 1.0
+
+				// Direct call, no 'go' keyword
+				sendSingleInterest(app, stats, sequenceNum, flowCtx, false)
+			}
 		}
-		rc.mu.Unlock()
-
-		rc.stats.IncrementRetx()
-		// log.Warn(consumerTag, "Retransmitting", "name", pkt.Name, "flow", pkt.Prefix)
-
-		// Send the packet again (isRetransmission = true)
-		go sendSingleInterest(rc.app, rc.stats, pkt.SequenceNum, pkt.FlowCtx, true)
 	}
 }
 
-var globalRetxController *RetransmissionController
-
-// --- Helpers ---
-
-func extractPrefix(name enc.Name) string {
-	if len(name) > 1 {
-		return name.Prefix(len(name) - 1).String()
+func main() {
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "Usage: %s <node_name> <producer_range>\n", os.Args[0])
+		os.Exit(1)
 	}
-	return name.String()
+
+	nodeName := os.Args[1]
+	rangeStr := os.Args[2]
+	consumerNodeName = nodeName
+
+	targetPrefixes, err := parseProducerRange(rangeStr)
+	if err != nil {
+		log.Fatal(consumerTag, "Failed to parse producer range", "err", err)
+		return
+	}
+
+	log.Default().SetLevel(log.LevelDebug)
+	// log.Default().SetLevel(log.LevelInfo)
+	os.Setenv("NDN_CLIENT_TRANSPORT", "tcp://127.0.0.1:6363")
+
+	app := engine.NewBasicEngine(engine.NewDefaultFace())
+	err = app.Start()
+	if err != nil {
+		log.Fatal(consumerTag, "Unable to start engine", "err", err)
+		return
+	}
+	defer app.Stop()
+
+	stats := &Statistics{}
+
+	// Initialize Heap-based Retransmission Controller
+	globalRetxController = NewRetransmissionController(app, stats)
+	go globalRetxController.StartScheduler()
+	defer globalRetxController.Stop()
+
+	log.Info(consumerTag, "Starting Optimized NDN Consumer",
+		"nodeName", nodeName,
+		"targets", len(targetPrefixes),
+		"mode", "TokenBucket+HeapRetx")
+
+	var wg sync.WaitGroup
+	startTime := time.Now()
+	flowContexts := make([]*FlowContext, 0, len(targetPrefixes))
+
+	for _, prefix := range targetPrefixes {
+		wg.Add(1)
+		flowCtx := NewFlowContext(prefix)
+		flowContexts = append(flowContexts, flowCtx)
+		go runFlow(app, stats, flowCtx, &wg)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(startTime)
+	log.Info(consumerTag, "All flows stopped", "elapsedTime", elapsed)
+
+	time.Sleep(1 * time.Second)
+	stats.Print()
+
+	log.Info(consumerTag, "=== Final Per-Flow Statistics ===")
+	for _, flowCtx := range flowContexts {
+		avgThroughput, totalBytes, duration := flowCtx.GetFinalStats()
+		log.Info(consumerTag, "Flow Summary",
+			"flow", flowCtx.Prefix,
+			"totalBytes", totalBytes,
+			"avgMbps", avgThroughput,
+			"duration", duration)
+	}
+}
+
+// Helpers
+
+// extractSeqNum extracts the sequence number from a name string.
+// Expected format: /prefix/node/[pd/<index>/|dt/]seq-<num>
+// Returns -1 if parsing fails.
+func extractSeqNum(nameStr string) int {
+	parts := strings.Split(nameStr, "/")
+	if len(parts) == 0 {
+		return -1
+	}
+	// Last component should be "seq-N"
+	lastPart := parts[len(parts)-1]
+	if !strings.HasPrefix(lastPart, "seq-") {
+		return -1
+	}
+	seqStr := strings.TrimPrefix(lastPart, "seq-")
+	seqNum, err := strconv.Atoi(seqStr)
+	if err != nil {
+		return -1
+	}
+	return seqNum
 }
 
 func parseProducerRange(rangeStr string) ([]string, error) {
@@ -576,209 +794,10 @@ func parseProducerRange(rangeStr string) ([]string, error) {
 	return prefixes, nil
 }
 
-func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flowCtx *FlowContext, isRetransmission bool) {
-	name, err := enc.NameFromStr(flowCtx.Prefix)
-	if err != nil {
-		return
-	}
-
-	seqStr := fmt.Sprintf("seq-%d", sequenceNum)
-	name = name.Append(enc.NewStringComponent(0x08, seqStr))
-
-	intCfg := &ndn.InterestConfig{
-		MustBeFresh: true,
-		Lifetime:    optional.Some(INTEREST_LIFETIME),
-		Nonce:       utils.ConvertNonce(app.Timer().Nonce()),
-	}
-
-	interest, err := app.Spec().MakeInterest(name, intCfg, nil, nil)
-	if err != nil {
-		return
-	}
-
-	stats.IncrementSent()
-	interestName := interest.FinalName.String()
-	sendTime := time.Now()
-
-	// 1. Record for RTT calculation
-	// MODIFIED: We record this for EVERY send attempt (including retransmissions).
-	// This resets the timer for this specific interest, so if we receive Data,
-	// the RTT will reflect the time since the *latest* retransmission.
-	globalRTTTracker.RecordInterestSent(interestName, flowCtx.Prefix, sendTime)
-
-	// 2. Register for Retransmission Check (Update timestamp if it exists, add if new)
-	globalRetxController.Add(interestName, flowCtx.Prefix, sequenceNum, flowCtx)
-
-	err = app.Express(interest,
-		func(args ndn.ExpressCallbackArgs) {
-			receiveTime := time.Now()
-			switch args.Result {
-			case ndn.InterestResultNack:
-				stats.IncrementNack()
-				globalRTTTracker.RecordInterestTimeout(interestName)
-				globalRetxController.Remove(interestName) // Stop retransmitting
-			case ndn.InterestResultTimeout:
-				stats.IncrementTimeout()
-				globalRTTTracker.RecordInterestTimeout(interestName)
-				globalRetxController.Remove(interestName) // Engine gave up, we stop too
-			case ndn.InterestCancelled:
-				stats.IncrementCancel()
-				globalRTTTracker.RecordInterestTimeout(interestName)
-				globalRetxController.Remove(interestName)
-			case ndn.InterestResultData:
-				data := args.Data
-				content := data.Content().Join()
-				dataName := data.Name().String()
-				prefix := extractPrefix(data.Name())
-
-				// Stop Retransmission Tracking
-				globalRetxController.Remove(dataName)
-
-				// 1. RTO Calculation
-				// rttSample, mean, variance, rto := globalRTTTracker.RecordDataReceived(dataName, prefix, receiveTime)
-				rttSample, _, _, _ := globalRTTTracker.RecordDataReceived(dataName, prefix, receiveTime)
-
-				// 2. Throughput & Rate Control Update
-				flowCtx.RecordPacket(len(content), rttSample)
-
-				// log.Info(consumerTag, "Data Received",
-				// 	"seq", sequenceNum,
-				// 	"prefix", prefix,
-				// 	"rtt", rttSample,
-				// 	"MeanRTT", mean,
-				// 	"Variance", variance,
-				// 	"FinalRTO", rto,
-				// 	"currentRate", flowCtx.GetRate())
-
-				stats.IncrementData()
-			}
-		})
-}
-
-func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	totalTimer := time.NewTimer(TOTAL_DURATION)
-	defer totalTimer.Stop()
-
-	sequenceNum := 0
-
-	log.Info(consumerTag, "Starting flow",
-		"target", flowCtx.Prefix,
-		"initRate", INIT_INTEREST_RATE,
-		"maxPackets", MAX_PACKETS)
-
-	for {
-		select {
-		case <-totalTimer.C:
-			log.Info(consumerTag, "Flow stopped (Timeout)", "target", flowCtx.Prefix)
-			return
-		case <-flowCtx.doneCh:
-			log.Info(consumerTag, "Flow stopped (Completed)", "target", flowCtx.Prefix)
-			return
-		default:
-			// Check if we have sent enough interests
-			if sequenceNum >= MAX_PACKETS {
-				// We have sent the max number of interests.
-				// Do NOT return yet. We must wait for the packets to be received (via doneCh)
-				// or for the hard timeout (via totalTimer).
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-
-			// Dynamic Rate Control
-			currentRate := flowCtx.GetRate()
-
-			if currentRate <= 0 {
-				currentRate = 1
-			}
-
-			sleepDuration := time.Duration(float64(time.Second) / currentRate)
-			time.Sleep(sleepDuration)
-
-			sequenceNum++
-			// Send new packet (isRetransmission = false)
-			go sendSingleInterest(app, stats, sequenceNum, flowCtx, false)
-		}
-	}
-}
-
-func main() {
-	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <node_name> <producer_range>\n", os.Args[0])
-		os.Exit(1)
-	}
-
-	nodeName := os.Args[1]
-	rangeStr := os.Args[2]
-
-	targetPrefixes, err := parseProducerRange(rangeStr)
-	if err != nil {
-		log.Fatal(consumerTag, "Failed to parse producer range", "err", err)
-		return
-	}
-
-	log.Default().SetLevel(log.LevelInfo)
-	os.Setenv("NDN_CLIENT_TRANSPORT", "tcp://127.0.0.1:6363")
-
-	app := engine.NewBasicEngine(engine.NewDefaultFace())
-	err = app.Start()
-	if err != nil {
-		log.Fatal(consumerTag, "Unable to start engine", "err", err)
-		return
-	}
-	defer app.Stop()
-
-	stats := &Statistics{}
-
-	// Initialize Retransmission Controller
-	globalRetxController = NewRetransmissionController(app, stats)
-	go globalRetxController.StartScheduler()
-	defer globalRetxController.Stop()
-
-	log.Info(consumerTag, "Starting NDN Consumer",
-		"nodeName", nodeName,
-		"targets", targetPrefixes,
-		"initRate", INIT_INTEREST_RATE,
-		"maxPackets", MAX_PACKETS,
-		"totalDuration", TOTAL_DURATION)
-
-	var wg sync.WaitGroup
-	startTime := time.Now()
-	flowContexts := make([]*FlowContext, 0, len(targetPrefixes))
-
-	for _, prefix := range targetPrefixes {
-		wg.Add(1)
-		flowCtx := NewFlowContext(prefix)
-		flowContexts = append(flowContexts, flowCtx)
-		go runFlow(app, stats, flowCtx, &wg)
-	}
-
-	wg.Wait()
-	elapsed := time.Since(startTime)
-	log.Info(consumerTag, "All flows stopped", "elapsedTime", elapsed)
-
-	// Wait a bit for any lingering logs/stats updates
-	time.Sleep(1 * time.Second)
-
-	stats.Print()
-	globalRTTTracker.PrintStats()
-
-	log.Info(consumerTag, "=== Final Per-Flow Statistics ===")
-	for _, flowCtx := range flowContexts {
-		avgThroughput, totalBytes, duration := flowCtx.GetFinalStats()
-		log.Info(consumerTag, "Flow Summary",
-			"flow", flowCtx.Prefix,
-			"totalBytes", totalBytes,
-			"timeTakenSec", duration,
-			"avgThroughput", avgThroughput,
-			"unit", "Mbps")
-	}
-}
-
 // package main
 
 // import (
+// 	"container/heap"
 // 	"fmt"
 // 	"math"
 // 	"os"
@@ -795,62 +814,123 @@ func main() {
 // 	"github.com/named-data/ndnd/std/utils"
 // )
 
+// // TODO: this setup is for 10Mbps
+// // const (
+// // 	INIT_INTEREST_RATE    = 600.0                 // Initial Rate: interests/sec
+// // 	TOTAL_DURATION        = 30 * time.Second      // Max duration
+// // 	MAX_PACKETS           = 3000                  // Target packets per flow
+// // 	INTEREST_LIFETIME     = 4 * time.Second       // Interest lifetime
+// // 	RTT_WINDOW_DURATION   = 1 * time.Second       // RTT sample window
+// // 	MIN_RTO               = 300.0                 // Min RTO (ms)
+// // 	MAX_RTO               = 3000.0                // Max RTO (ms)
+// // 	THROUGHPUT_WINDOW_DUR = 20 * time.Millisecond // Sliding window size
+// // 	TICKER_INTERVAL       = 1 * time.Millisecond  // Granularity for Token Bucket
+// // )
+
+// // TODO: 50Mbps setup
 // const (
-// 	INIT_INTEREST_RATE    = 2000.0                 // Initial Rate: 2000 interests/sec
-// 	TOTAL_DURATION        = 10 * time.Second       // Max duration (hard stop)
-// 	MAX_PACKETS           = 30000                  // Target packets to receive per flow
-// 	INTEREST_LIFETIME     = 4 * time.Second        // Individual Interest lifetime
-// 	RTT_WINDOW_DURATION   = 1 * time.Second        // Duration to keep RTT samples for RTO calc
-// 	MIN_RTO               = 30.0                   // Minimum RTO in milliseconds
-// 	THROUGHPUT_WINDOW_DUR = 100 * time.Millisecond // Sliding window size for throughput/RTT
-// 	CHECK_INTERVAL        = 30 * time.Millisecond  // Retransmission check interval
+// 	INIT_INTEREST_RATE    = 3000.0                // Initial Rate: interests/sec
+// 	TOTAL_DURATION        = 30 * time.Second      // Max duration
+// 	MAX_PACKETS           = 15000                 // Target packets per flow
+// 	INTEREST_LIFETIME     = 4 * time.Second       // Interest lifetime
+// 	RTT_WINDOW_DURATION   = 1 * time.Second       // RTT sample window
+// 	MIN_RTO               = 60.0                  // Min RTO (ms)
+// 	MAX_RTO               = 600.0                 // Max RTO (ms)
+// 	THROUGHPUT_WINDOW_DUR = 20 * time.Millisecond // Sliding window size
+// 	TICKER_INTERVAL       = 1 * time.Millisecond  // Granularity for Token Bucket
 // )
 
 // // Create a tag for our consumer application
 // type ConsumerTag struct{}
 
-// func (ConsumerTag) String() string {
-// 	return "NDN-Consumer"
-// }
+// func (ConsumerTag) String() string { return "NDN-Consumer" }
 
 // var consumerTag = ConsumerTag{}
 
-// // PacketSample helps track throughput and RTT in the sliding window
+// type TransmissionMode int
+
+// const (
+// 	ModePD TransmissionMode = iota
+// 	ModeDT
+// )
+
+// var selectedMode = ModePD
+// var consumerNodeName string
+
+// // PacketSample for throughput calculation
 // type PacketSample struct {
 // 	Timestamp time.Time
 // 	Size      int
-// 	RTT       float64 // in milliseconds
+// 	RTT       float64
 // }
 
-// // FlowContext holds state specific to a single flow (target prefix)
+// // RTTSample for RTO calculation
+// type RTTSample struct {
+// 	Timestamp time.Time
+// 	RTT       float64
+// }
+
+// // --- OPTIMIZATION C: Decentralized RTT Tracking ---
+// // RTT logic is moved inside FlowContext to avoid global lock contention.
+
 // type FlowContext struct {
 // 	mu     sync.Mutex
 // 	Prefix string
 
-// 	// Statistics
+// 	// Pre-computed base name components to save allocations (Optimization D)
+// 	baseName enc.Name
+
+// 	// Path Discovery
+// 	PdIndex    int
+// 	PdFinished bool
+
+// 	// General Stats
 // 	totalBytes        int64
-// 	pktsReceivedTotal int // Total valid Data packets received
+// 	pktsReceivedTotal int
 // 	startTime         time.Time
 // 	endTime           time.Time
 // 	isFinished        bool
-// 	doneCh            chan struct{} // Signal channel when MAX_PACKETS reached
+// 	doneCh            chan struct{}
 
-// 	// Unified Sliding Window (100ms)
-// 	window []PacketSample
+// 	// Rate Control / Throughput Window
+// 	window           []PacketSample
+// 	currentRate      float64
+// 	pktsCalibrated   int
+// 	initialRTTSum    float64
+// 	baseRTT          float64
+// 	adjustmentPeriod time.Duration
+// 	lastRateUpdate   time.Time
 
-// 	// Rate Control State
-// 	currentRate      float64       // Interests per second
-// 	pktsCalibrated   int           // Count for initial calibration (distinct from total)
-// 	initialRTTSum    float64       // Sum of first 5 RTTs
-// 	baseRTT          float64       // Average of first 5 RTTs (Baseline)
-// 	adjustmentPeriod time.Duration // Calculated from first 5 packets
-// 	lastRateUpdate   time.Time     // Last time we adjusted the rate
+// 	// --- RTT / RTO State (Per-Flow) ---
+// 	rttHistory []RTTSample
+// 	srtt       float64
+// 	rttVar     float64
+// 	rto        float64
+
+// 	// Map to track send times for RTT calculation within this flow
+// 	pendingSends map[string]time.Time
 // }
 
 // func NewFlowContext(prefix string) *FlowContext {
 // 	now := time.Now()
+
+// 	// Pre-compute base name: /<prefix>/<node>/[pd/0 | dt]
+// 	// This avoids parsing the prefix string for every packet.
+// 	n, _ := enc.NameFromStr(prefix)
+// 	if consumerNodeName != "" {
+// 		n = n.Append(enc.NewStringComponent(0x08, consumerNodeName))
+// 	}
+// 	if selectedMode == ModePD {
+// 		n = n.Append(enc.NewStringComponent(0x08, "pd"))
+// 		n = n.Append(enc.NewStringComponent(0x08, "0")) // Default index 0
+// 	} else {
+// 		n = n.Append(enc.NewStringComponent(0x08, "dt"))
+// 	}
+
 // 	return &FlowContext{
 // 		Prefix:         prefix,
+// 		baseName:       n,
+// 		PdIndex:        0,
 // 		startTime:      now,
 // 		endTime:        now,
 // 		window:         make([]PacketSample, 0),
@@ -858,151 +938,207 @@ func main() {
 // 		pktsCalibrated: 0,
 // 		lastRateUpdate: now,
 // 		doneCh:         make(chan struct{}),
+
+// 		// RTT Init
+// 		rttHistory:   make([]RTTSample, 0),
+// 		srtt:         0,
+// 		rttVar:       0,
+// 		rto:          MIN_RTO * 2,
+// 		pendingSends: make(map[string]time.Time),
 // 	}
 // }
 
-// // GetRate returns the current dynamic sending rate
 // func (f *FlowContext) GetRate() float64 {
 // 	f.mu.Lock()
 // 	defer f.mu.Unlock()
 // 	return f.currentRate
 // }
 
-// // RecordPacket updates window, stats, and adjusts sending rate based on RTT congestion control
-// func (f *FlowContext) RecordPacket(payloadSize int, rttVal float64) {
+// func (f *FlowContext) GetRTO() float64 {
+// 	f.mu.Lock()
+// 	defer f.mu.Unlock()
+// 	return f.rto
+// }
+
+// // RecordInterestSend stores timestamp for RTT calc
+// func (f *FlowContext) RecordInterestSend(name string, t time.Time) {
+// 	f.mu.Lock()
+// 	f.pendingSends[name] = t
+// 	f.mu.Unlock()
+// }
+
+// // RecordPacket handles both RTT calculation and Rate Adaptation
+// func (f *FlowContext) RecordPacket(payloadSize int, dataName string, receiveTime time.Time) {
 // 	f.mu.Lock()
 // 	defer f.mu.Unlock()
 
-// 	now := time.Now()
+// 	// --- 1. RTT Calculation Logic (Moved from global tracker) ---
+// 	sendTime, ok := f.pendingSends[dataName]
+// 	if !ok {
+// 		// Might be a duplicate or timed out already
+// 		return
+// 	}
+// 	delete(f.pendingSends, dataName) // Clean up
 
-// 	// Only update stats if we haven't finished yet to prevent skewing stats after completion
+// 	rttVal := float64(receiveTime.Sub(sendTime).Nanoseconds()) / 1e6
+
+// 	// Log data received every 200 packets (per prefix)
+// 	seqNum := extractSeqNum(dataName)
+// 	if seqNum >= 0 && seqNum%200 == 0 {
+// 		log.Debug(consumerTag, "Data Received",
+// 			"name", dataName,
+// 			"rtt", rttVal)
+// 	}
+
+// 	// Update RTT History Window
+// 	f.rttHistory = append(f.rttHistory, RTTSample{Timestamp: receiveTime, RTT: rttVal})
+
+// 	// Prune old RTT samples
+// 	validIdx := 0
+// 	for i, s := range f.rttHistory {
+// 		if receiveTime.Sub(s.Timestamp) <= RTT_WINDOW_DURATION {
+// 			validIdx = i
+// 			break
+// 		}
+// 	}
+// 	f.rttHistory = f.rttHistory[validIdx:]
+
+// 	// Calculate RTO (Equations)
+// 	count := len(f.rttHistory)
+// 	var meanRTT, variance, calculatedRTO, finalRTO float64
+
+// 	if count < 2 {
+// 		meanRTT = rttVal
+// 		variance = 0.0
+// 		calculatedRTO = math.Max(MIN_RTO, 2*rttVal)
+// 		finalRTO = 3 * calculatedRTO
+// 	} else {
+// 		var sum float64
+// 		for _, s := range f.rttHistory {
+// 			sum += s.RTT
+// 		}
+// 		meanRTT = sum / float64(count)
+
+// 		var varSum float64
+// 		for _, s := range f.rttHistory {
+// 			diff := s.RTT - meanRTT
+// 			varSum += diff * diff
+// 		}
+// 		variance = varSum / float64(count)
+
+// 		stdDev := math.Sqrt(variance)
+// 		calculatedRTO = meanRTT + 4*stdDev
+// 		finalRTO = 3 * calculatedRTO
+// 	}
+
+// 	if finalRTO < MIN_RTO {
+// 		finalRTO = MIN_RTO
+// 	}
+// 	if finalRTO > MAX_RTO {
+// 		finalRTO = MAX_RTO
+// 	}
+
+// 	f.srtt = meanRTT
+// 	f.rttVar = variance
+// 	f.rto = finalRTO
+
+// 	// --- 2. Stats & Rate Control ---
+
 // 	if f.isFinished {
 // 		return
 // 	}
 
-// 	f.endTime = now
+// 	f.endTime = receiveTime
 // 	f.totalBytes += int64(payloadSize)
 // 	f.pktsReceivedTotal++
 
-// 	// Check for completion
 // 	if f.pktsReceivedTotal >= MAX_PACKETS {
 // 		f.isFinished = true
 // 		close(f.doneCh)
 // 	}
 
-// 	// 1. Update Sliding Window (Add new, remove old > 100ms)
-// 	f.window = append(f.window, PacketSample{
-// 		Timestamp: now,
-// 		Size:      payloadSize,
-// 		RTT:       rttVal,
-// 	})
-
-// 	cutoff := now.Add(-THROUGHPUT_WINDOW_DUR)
-// 	validIdx := 0
-// 	for i, sample := range f.window {
-// 		if sample.Timestamp.After(cutoff) {
-// 			validIdx = i
+// 	// Update Throughput Window
+// 	f.window = append(f.window, PacketSample{Timestamp: receiveTime, Size: payloadSize, RTT: rttVal})
+// 	cutoff := receiveTime.Add(-THROUGHPUT_WINDOW_DUR)
+// 	validWinIdx := 0
+// 	for i, s := range f.window {
+// 		if s.Timestamp.After(cutoff) {
+// 			validWinIdx = i
 // 			break
 // 		}
 // 	}
-// 	// Prune the slice
-// 	f.window = f.window[validIdx:]
+// 	f.window = f.window[validWinIdx:]
 
-// 	// 2. Initial Adjustment Period Calculation (First 5 packets)
+// 	// Calibration & Dynamic Rate (Same logic as original, just integrated)
 // 	if f.pktsCalibrated < 5 {
 // 		f.initialRTTSum += rttVal
 // 		f.pktsCalibrated++
-
 // 		if f.pktsCalibrated == 5 {
-// 			// Calculate Base RTT
 // 			f.baseRTT = f.initialRTTSum / 5.0
-
-// 			// Calculate adjustment period based on sum of first 5 RTTs
 // 			f.adjustmentPeriod = time.Duration(f.initialRTTSum) * time.Millisecond
-
-// 			// Safety lower bound for adjustment period
 // 			if f.adjustmentPeriod < 20*time.Millisecond {
 // 				f.adjustmentPeriod = 20 * time.Millisecond
 // 			}
-
-// 			f.lastRateUpdate = now
-// 			log.Info(consumerTag, "Flow Calibration Complete",
-// 				"flow", f.Prefix,
-// 				"baseRTT", f.baseRTT,
-// 				"period", f.adjustmentPeriod)
+// 			f.lastRateUpdate = receiveTime
+// 			log.Info(consumerTag, "Flow Calibration Complete", "flow", f.Prefix, "baseRTT", f.baseRTT)
 // 		}
-// 		return // Don't adjust rate yet
+// 		return
 // 	}
 
-// 	// 3. Dynamic Rate Adjustment
-// 	if now.Sub(f.lastRateUpdate) >= f.adjustmentPeriod {
-
-// 		// Calculate Window Statistics
-// 		var totalRTT float64
-// 		count := len(f.window)
-
-// 		if count == 0 {
+// 	if receiveTime.Sub(f.lastRateUpdate) >= f.adjustmentPeriod {
+// 		// Simple congestion control logic
+// 		var totalWinRTT float64
+// 		wCount := len(f.window)
+// 		if wCount == 0 {
 // 			return
 // 		}
 
 // 		for _, s := range f.window {
-// 			totalRTT += s.RTT
+// 			totalWinRTT += s.RTT
 // 		}
-// 		windowAvgRTT := totalRTT / float64(count)
+// 		avgWinRTT := totalWinRTT / float64(wCount)
+// 		measuredPPS := float64(wCount) / THROUGHPUT_WINDOW_DUR.Seconds()
 
-// 		// Calculate Throughput (PPS)
-// 		windowSeconds := THROUGHPUT_WINDOW_DUR.Seconds()
-// 		measuredThroughputPPS := float64(count) / windowSeconds
-
-// 		// Determine Target Rate based on RTT comparison
 // 		targetRate := f.currentRate
-
-// 		if windowAvgRTT < 1.5*f.baseRTT {
-// 			// Low congestion: Probe more bandwidth
-// 			targetRate = f.currentRate * 1.1
-// 		} else if windowAvgRTT >= 1.5*f.baseRTT && windowAvgRTT < 2.0*f.baseRTT {
-// 			// Moderate congestion: Hold rate
+// 		if avgWinRTT < 3*f.baseRTT {
+// 			targetRate = f.currentRate * 1.05
+// 		} else if avgWinRTT >= 3*f.baseRTT && avgWinRTT < 6*f.baseRTT {
 // 			targetRate = f.currentRate
 // 		} else {
-// 			// High congestion (>= 2 * base): Back off
-// 			targetRate = f.currentRate * 0.8
+// 			targetRate = f.currentRate * 0.95
 // 		}
 
-// 		// Apply Throughput Caps
-// 		lowerBound := 0.8 * measuredThroughputPPS
-// 		upperBound := 1.5 * measuredThroughputPPS
-
-// 		if lowerBound < 1.0 {
-// 			lowerBound = 1.0
+// 		// Caps
+// 		lower := 0.8 * measuredPPS
+// 		if lower < 1.0 {
+// 			lower = 1.0
 // 		}
-// 		if upperBound < INIT_INTEREST_RATE {
-// 			upperBound = INIT_INTEREST_RATE
-// 		}
-
-// 		finalRate := targetRate
-
-// 		if finalRate < lowerBound {
-// 			finalRate = lowerBound
-// 		}
-// 		if finalRate > upperBound {
-// 			finalRate = upperBound
+// 		upper := 1.75 * measuredPPS
+// 		if upper < INIT_INTEREST_RATE {
+// 			upper = INIT_INTEREST_RATE
 // 		}
 
-// 		if finalRate < 10.0 {
-// 			finalRate = 10.0
+// 		if targetRate < lower {
+// 			targetRate = lower
+// 		}
+// 		if targetRate > upper {
+// 			targetRate = upper
+// 		}
+// 		if targetRate < 10.0 {
+// 			targetRate = 10.0
 // 		}
 
-// 		prevRate := f.currentRate
-// 		f.currentRate = finalRate
-// 		f.lastRateUpdate = now
+// 		oldRate := f.currentRate
+// 		f.currentRate = targetRate
+// 		f.lastRateUpdate = receiveTime
 
-// 		log.Info(consumerTag, "Rate Adjusted",
-// 			"flow", f.Prefix,
+// 		// Log rate adjustment
+// 		log.Debug(consumerTag, "Rate Adjusted",
+// 			"prefix", f.Prefix,
+// 			"oldRate", oldRate,
+// 			"newRate", f.currentRate,
 // 			"baseRTT", f.baseRTT,
-// 			"winAvgRTT", windowAvgRTT,
-// 			"measuredPPS", measuredThroughputPPS,
-// 			"oldRate", prevRate,
-// 			"finalRate", f.currentRate)
+// 			"latestRTT", avgWinRTT)
 // 	}
 // }
 
@@ -1013,174 +1149,11 @@ func main() {
 // 	if duration <= 0 {
 // 		return 0.0, f.totalBytes, 0.0
 // 	}
-// 	// Change to Mbps: (Bytes * 8) / (Seconds * 1,000,000)
-// 	throughputMbps := (float64(f.totalBytes) * 8.0) / (duration * 1000000.0)
+// 	throughputMbps := (float64(f.totalBytes) * 8.0) / (duration * 1e6)
 // 	return throughputMbps, f.totalBytes, duration
 // }
 
-// // RTTSample holds a single RTT measurement
-// type RTTSample struct {
-// 	Timestamp time.Time
-// 	RTT       float64 // in milliseconds
-// }
-
-// // RTTTracker structure
-// type RTTTracker struct {
-// 	mu               sync.RWMutex
-// 	pendingInterests map[string]time.Time // interest name -> send time
-
-// 	// Per-prefix history for RTO calculation
-// 	rttHistory map[string][]RTTSample
-
-// 	// Current calculated metrics per prefix
-// 	srtt   map[string]float64 // Stores the Mean RTT (Equation 1)
-// 	rttVar map[string]float64 // Stores the Variance (Equation 2)
-// 	rto    map[string]float64 // Stores the Final Threshold (Equation 4)
-
-// 	totalSamples int
-// 	totalRTT     float64
-// }
-
-// func NewRTTTracker() *RTTTracker {
-// 	return &RTTTracker{
-// 		pendingInterests: make(map[string]time.Time),
-// 		rttHistory:       make(map[string][]RTTSample),
-// 		srtt:             make(map[string]float64),
-// 		rttVar:           make(map[string]float64),
-// 		rto:              make(map[string]float64),
-// 		totalSamples:     0,
-// 		totalRTT:         0,
-// 	}
-// }
-
-// // GetRTO returns the current RTO for a prefix, or a default value if unknown
-// func (rtt *RTTTracker) GetRTO(prefix string) float64 {
-// 	rtt.mu.RLock()
-// 	defer rtt.mu.RUnlock()
-// 	if val, ok := rtt.rto[prefix]; ok {
-// 		return val
-// 	}
-// 	return MIN_RTO * 2 // Default conservative RTO
-// }
-
-// func (rtt *RTTTracker) RecordInterestSent(interestName string, prefix string, sendTime time.Time) {
-// 	rtt.mu.Lock()
-// 	defer rtt.mu.Unlock()
-// 	rtt.pendingInterests[interestName] = sendTime
-
-// 	if _, exists := rtt.rttHistory[prefix]; !exists {
-// 		rtt.rttHistory[prefix] = make([]RTTSample, 0)
-// 		rtt.srtt[prefix] = 0
-// 		rtt.rttVar[prefix] = 0
-// 		rtt.rto[prefix] = MIN_RTO * 2
-// 	}
-// }
-
-// // RecordDataReceived calculates RTO based on the provided 4 equations.
-// func (rtt *RTTTracker) RecordDataReceived(dataName string, prefix string, receiveTime time.Time) (float64, float64, float64, float64) {
-// 	rtt.mu.Lock()
-// 	defer rtt.mu.Unlock()
-
-// 	sendTime, exists := rtt.pendingInterests[dataName]
-// 	if !exists {
-// 		return 0, 0, 0, 0
-// 	}
-
-// 	rttSampleVal := float64(receiveTime.Sub(sendTime).Nanoseconds()) / 1e6
-
-// 	rtt.totalSamples++
-// 	rtt.totalRTT += rttSampleVal
-// 	delete(rtt.pendingInterests, dataName)
-
-// 	// Update History Window
-// 	newSample := RTTSample{Timestamp: receiveTime, RTT: rttSampleVal}
-// 	rtt.rttHistory[prefix] = append(rtt.rttHistory[prefix], newSample)
-
-// 	// Remove samples older than window duration
-// 	history := rtt.rttHistory[prefix]
-// 	validIdx := 0
-// 	for i, sample := range history {
-// 		if receiveTime.Sub(sample.Timestamp) <= RTT_WINDOW_DURATION {
-// 			validIdx = i
-// 			break
-// 		}
-// 	}
-// 	rtt.rttHistory[prefix] = history[validIdx:]
-// 	history = rtt.rttHistory[prefix]
-
-// 	// --- RTO Calculation (Equations 1, 2, 3, 4) ---
-
-// 	var meanRTT, variance, calculatedRTO, finalRTO float64
-
-// 	if len(history) < 2 {
-// 		// Not enough samples for variance.
-// 		meanRTT = rttSampleVal
-// 		variance = 0.0
-// 		calculatedRTO = math.Max(MIN_RTO, 2*rttSampleVal)
-// 		finalRTO = 2 * calculatedRTO
-// 	} else {
-// 		// Equation 1: Sample Mean RTT
-// 		var sum float64
-// 		for _, s := range history {
-// 			sum += s.RTT
-// 		}
-// 		meanRTT = sum / float64(len(history))
-
-// 		// Equation 2: Sample Variance
-// 		var varSum float64
-// 		for _, s := range history {
-// 			diff := s.RTT - meanRTT
-// 			varSum += diff * diff
-// 		}
-// 		variance = varSum / float64(len(history))
-
-// 		// Equation 3: RTO = Mean + 4 * sqrt(Variance)
-// 		stdDev := math.Sqrt(variance)
-// 		calculatedRTO = meanRTT + 4*stdDev
-
-// 		// Clamp RTO
-// 		if calculatedRTO < MIN_RTO {
-// 			calculatedRTO = MIN_RTO
-// 		}
-
-// 		// Equation 4: RTO_threshold = 2 * RTO_final
-// 		finalRTO = 2 * calculatedRTO
-// 	}
-
-// 	// Update State
-// 	rtt.srtt[prefix] = meanRTT
-// 	rtt.rttVar[prefix] = variance
-// 	rtt.rto[prefix] = finalRTO
-
-// 	return rttSampleVal, meanRTT, variance, finalRTO
-// }
-
-// func (rtt *RTTTracker) RecordInterestTimeout(interestName string) {
-// 	rtt.mu.Lock()
-// 	defer rtt.mu.Unlock()
-// 	delete(rtt.pendingInterests, interestName)
-// }
-
-// func (rtt *RTTTracker) PrintStats() {
-// 	rtt.mu.RLock()
-// 	defer rtt.mu.RUnlock()
-
-// 	var avgRTT float64
-// 	if rtt.totalSamples > 0 {
-// 		avgRTT = rtt.totalRTT / float64(rtt.totalSamples)
-// 	}
-
-// 	log.Info(consumerTag, "=== RTT Statistics ===")
-// 	log.Info(consumerTag, "Global RTT Stats", "avgRTT", avgRTT, "samples", rtt.totalSamples)
-
-// 	for prefix, val := range rtt.srtt {
-// 		log.Info(consumerTag, "Per-Prefix RTO State",
-// 			"prefix", prefix,
-// 			"MeanRTT(SRTT)", val,
-// 			"Variance(RTTVAR)", rtt.rttVar[prefix],
-// 			"FinalThreshold(RTO)", rtt.rto[prefix])
-// 	}
-// }
+// // --- Statistics ---
 
 // type Statistics struct {
 // 	mu              sync.Mutex
@@ -1188,22 +1161,19 @@ func main() {
 // 	dataReceived    int
 // 	nackReceived    int
 // 	timeoutReceived int
-// 	cancelReceived  int
 // 	retransmissions int
 // }
 
-// func (s *Statistics) IncrementSent()    { s.mu.Lock(); defer s.mu.Unlock(); s.totalSent++ }
-// func (s *Statistics) IncrementData()    { s.mu.Lock(); defer s.mu.Unlock(); s.dataReceived++ }
-// func (s *Statistics) IncrementNack()    { s.mu.Lock(); defer s.mu.Unlock(); s.nackReceived++ }
-// func (s *Statistics) IncrementTimeout() { s.mu.Lock(); defer s.mu.Unlock(); s.timeoutReceived++ }
-// func (s *Statistics) IncrementCancel()  { s.mu.Lock(); defer s.mu.Unlock(); s.cancelReceived++ }
-// func (s *Statistics) IncrementRetx()    { s.mu.Lock(); defer s.mu.Unlock(); s.retransmissions++ }
+// func (s *Statistics) IncrementSent()    { s.mu.Lock(); s.totalSent++; s.mu.Unlock() }
+// func (s *Statistics) IncrementData()    { s.mu.Lock(); s.dataReceived++; s.mu.Unlock() }
+// func (s *Statistics) IncrementNack()    { s.mu.Lock(); s.nackReceived++; s.mu.Unlock() }
+// func (s *Statistics) IncrementTimeout() { s.mu.Lock(); s.timeoutReceived++; s.mu.Unlock() }
+// func (s *Statistics) IncrementRetx()    { s.mu.Lock(); s.retransmissions++; s.mu.Unlock() }
 
 // func (s *Statistics) Print() {
 // 	s.mu.Lock()
 // 	defer s.mu.Unlock()
-// 	log.Info(consumerTag, "=== Final Statistics ===")
-// 	log.Info(consumerTag, "Summary",
+// 	log.Info(consumerTag, "=== Final Statistics ===",
 // 		"totalSent", s.totalSent,
 // 		"dataReceived", s.dataReceived,
 // 		"nackReceived", s.nackReceived,
@@ -1211,63 +1181,152 @@ func main() {
 // 		"retransmissions", s.retransmissions)
 // }
 
-// var globalRTTTracker = NewRTTTracker()
-
-// // --- Retransmission Logic ---
+// // --- OPTIMIZATION E: Heap-based Retransmission Controller ---
 
 // type PendingPacket struct {
 // 	Name        string
 // 	Prefix      string
-// 	SendTime    time.Time
+// 	Expiration  time.Time // Key for Heap
 // 	SequenceNum int
 // 	FlowCtx     *FlowContext
+// 	Index       int // For heap interface
+// }
+
+// // PacketHeap implements heap.Interface
+// type PacketHeap []*PendingPacket
+
+// func (h PacketHeap) Len() int           { return len(h) }
+// func (h PacketHeap) Less(i, j int) bool { return h[i].Expiration.Before(h[j].Expiration) }
+// func (h PacketHeap) Swap(i, j int) {
+// 	h[i], h[j] = h[j], h[i]
+// 	h[i].Index = i
+// 	h[j].Index = j
+// }
+// func (h *PacketHeap) Push(x interface{}) {
+// 	n := len(*h)
+// 	item := x.(*PendingPacket)
+// 	item.Index = n
+// 	*h = append(*h, item)
+// }
+// func (h *PacketHeap) Pop() interface{} {
+// 	old := *h
+// 	n := len(old)
+// 	item := old[n-1]
+// 	old[n-1] = nil // Avoid memory leak
+// 	item.Index = -1
+// 	*h = old[0 : n-1]
+// 	return item
 // }
 
 // type RetransmissionController struct {
-// 	mu               sync.Mutex
-// 	pendingInterests map[string]PendingPacket // Key: Interest Name
-// 	app              ndn.Engine
-// 	stats            *Statistics
-// 	stopCh           chan struct{}
+// 	mu sync.Mutex
+// 	pq PacketHeap
+// 	// Map to track status. If missing from map, it means it was acked/cancelled.
+// 	// If present, it maps to the SequenceNum to verify validity (in case of seq wrapping, though unlikely here)
+// 	active   map[string]int
+// 	app      ndn.Engine
+// 	stats    *Statistics
+// 	stopCh   chan struct{}
+// 	wakeupCh chan struct{} // To wake up the scheduler loop when new item added
 // }
 
 // func NewRetransmissionController(app ndn.Engine, stats *Statistics) *RetransmissionController {
-// 	return &RetransmissionController{
-// 		pendingInterests: make(map[string]PendingPacket),
-// 		app:              app,
-// 		stats:            stats,
-// 		stopCh:           make(chan struct{}),
+// 	rc := &RetransmissionController{
+// 		pq:       make(PacketHeap, 0),
+// 		active:   make(map[string]int),
+// 		app:      app,
+// 		stats:    stats,
+// 		stopCh:   make(chan struct{}),
+// 		wakeupCh: make(chan struct{}, 1),
 // 	}
+// 	heap.Init(&rc.pq)
+// 	return rc
 // }
 
 // func (rc *RetransmissionController) Add(name string, prefix string, seq int, flowCtx *FlowContext) {
 // 	rc.mu.Lock()
 // 	defer rc.mu.Unlock()
-// 	rc.pendingInterests[name] = PendingPacket{
+
+// 	// Calculate Expiration based on current Flow RTO
+// 	rto := flowCtx.GetRTO()
+// 	expiration := time.Now().Add(time.Duration(rto) * time.Millisecond)
+
+// 	pkt := &PendingPacket{
 // 		Name:        name,
 // 		Prefix:      prefix,
-// 		SendTime:    time.Now(),
+// 		Expiration:  expiration,
 // 		SequenceNum: seq,
 // 		FlowCtx:     flowCtx,
+// 	}
+
+// 	rc.active[name] = seq
+// 	heap.Push(&rc.pq, pkt)
+
+// 	// Non-blocking signal to wake up loop if this is the new earliest item
+// 	select {
+// 	case rc.wakeupCh <- struct{}{}:
+// 	default:
 // 	}
 // }
 
 // func (rc *RetransmissionController) Remove(name string) {
 // 	rc.mu.Lock()
 // 	defer rc.mu.Unlock()
-// 	delete(rc.pendingInterests, name)
+// 	// Lazy removal: just delete from map.
+// 	// When the heap pops the item, we check the map. If missing, we ignore.
+// 	delete(rc.active, name)
 // }
 
 // func (rc *RetransmissionController) StartScheduler() {
-// 	ticker := time.NewTicker(CHECK_INTERVAL)
-// 	defer ticker.Stop()
-
 // 	for {
+// 		var waitDuration time.Duration
+
+// 		rc.mu.Lock()
+// 		if rc.pq.Len() == 0 {
+// 			waitDuration = 10 * time.Second // Idle wait
+// 		} else {
+// 			now := time.Now()
+// 			top := rc.pq[0]
+// 			if now.After(top.Expiration) {
+// 				// Expired! Pop and Process
+// 				item := heap.Pop(&rc.pq).(*PendingPacket)
+
+// 				// Check if still active
+// 				if seq, exists := rc.active[item.Name]; exists && seq == item.SequenceNum {
+// 					// Needs Retransmission
+// 					// Re-add to heap with NEW expiration
+// 					rto := item.FlowCtx.GetRTO()
+// 					item.Expiration = now.Add(time.Duration(rto) * time.Millisecond)
+// 					heap.Push(&rc.pq, item)
+
+// 					// Unlock before sending to avoid blocking
+// 					rc.mu.Unlock()
+
+// 					rc.stats.IncrementRetx()
+// 					// Synchronous send (on a separate goroutine is fine here as Retx is low freq compared to main flow)
+// 					// But to keep it lightweight, we just fire it.
+// 					go sendSingleInterest(rc.app, rc.stats, item.SequenceNum, item.FlowCtx, true)
+// 					continue // Loop again immediately
+// 				}
+// 				// Else: was removed/acked, ignore.
+// 				rc.mu.Unlock()
+// 				continue
+// 			} else {
+// 				// Not expired yet
+// 				waitDuration = top.Expiration.Sub(now)
+// 			}
+// 		}
+// 		rc.mu.Unlock()
+
 // 		select {
 // 		case <-rc.stopCh:
 // 			return
-// 		case <-ticker.C:
-// 			rc.checkTimeouts()
+// 		case <-rc.wakeupCh:
+// 			// New item added, re-evaluate heap
+// 			continue
+// 		case <-time.After(waitDuration):
+// 			// Timer expired, check heap
+// 			continue
 // 		}
 // 	}
 // }
@@ -1276,59 +1335,232 @@ func main() {
 // 	close(rc.stopCh)
 // }
 
-// func (rc *RetransmissionController) checkTimeouts() {
-// 	rc.mu.Lock()
-// 	// We copy pending packets to a slice to avoid holding lock during retransmission
-// 	// However, for simplicity and thread-safety of the map, we can iterate and collect
-// 	// packets to retransmit, then retransmit them.
-// 	var toRetransmit []PendingPacket
-// 	now := time.Now()
+// var globalRetxController *RetransmissionController
 
-// 	for _, pkt := range rc.pendingInterests {
-// 		// Get Dynamic RTO for this flow
-// 		rtoVal := globalRTTTracker.GetRTO(pkt.Prefix)
-// 		rtoDuration := time.Duration(rtoVal) * time.Millisecond
+// // --- Sending Logic ---
 
-// 		if now.Sub(pkt.SendTime) > rtoDuration {
-// 			toRetransmit = append(toRetransmit, pkt)
-// 		}
+// // sendSingleInterest is now optimized for allocations and called synchronously
+// func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flowCtx *FlowContext, isRetransmission bool) {
+// 	// OPTIMIZATION D: Allocation Optimization
+// 	// Use pre-computed baseName. Append sequence number efficiently.
+// 	// Note: We need a copy because Append modifies the slice.
+// 	// Since enc.Name is essentially a slice of components, shallow copy is cheap,
+// 	// but appending requires new backing array usually.
+
+// 	// Create the sequence component string manually or efficiently
+// 	// Using strconv.AppendInt to a buffer to avoid fmt.Sprintf
+// 	// For simplicity in NDN lib usage, we create the component directly.
+
+// 	// We reconstruct name from base:
+// 	name := flowCtx.baseName.Append(enc.NewStringComponent(0x08, "seq-"+strconv.Itoa(sequenceNum)))
+
+// 	intCfg := &ndn.InterestConfig{
+// 		MustBeFresh: true,
+// 		Lifetime:    optional.Some(INTEREST_LIFETIME),
+// 		Nonce:       utils.ConvertNonce(app.Timer().Nonce()),
 // 	}
-// 	rc.mu.Unlock()
 
-// 	// Perform Retransmissions
-// 	for _, pkt := range toRetransmit {
-// 		// Update the timestamp in the map immediately to prevent double retransmission
-// 		// in the next tick if the network is very slow
-// 		rc.mu.Lock()
-// 		if _, exists := rc.pendingInterests[pkt.Name]; exists {
-// 			// Update send time
-// 			p := rc.pendingInterests[pkt.Name]
-// 			p.SendTime = time.Now()
-// 			rc.pendingInterests[pkt.Name] = p
-// 		} else {
-// 			// Packet might have been received/removed in the meantime
-// 			rc.mu.Unlock()
-// 			continue
+// 	interest, err := app.Spec().MakeInterest(name, intCfg, nil, nil)
+// 	if err != nil {
+// 		return
+// 	}
+
+// 	stats.IncrementSent()
+// 	interestName := interest.FinalName.String()
+// 	sendTime := time.Now()
+
+// 	// Log interest every 200 packets with current send rate
+// 	if sequenceNum%200 == 0 {
+// 		currentRate := flowCtx.GetRate()
+// 		log.Debug(consumerTag, "Interest Sent",
+// 			"name", interestName,
+// 			"rate", currentRate)
+// 	}
+
+// 	// Record send time for RTT (Local Flow Context)
+// 	flowCtx.RecordInterestSend(interestName, sendTime)
+
+// 	// Add to Heap Controller
+// 	globalRetxController.Add(interestName, flowCtx.Prefix, sequenceNum, flowCtx)
+
+// 	err = app.Express(interest,
+// 		func(args ndn.ExpressCallbackArgs) {
+// 			receiveTime := time.Now()
+// 			switch args.Result {
+// 			case ndn.InterestResultNack:
+// 				stats.IncrementNack()
+// 				globalRetxController.Remove(interestName)
+// 			case ndn.InterestResultTimeout:
+// 				stats.IncrementTimeout()
+// 				globalRetxController.Remove(interestName)
+// 			case ndn.InterestCancelled:
+// 				// stats.IncrementCancel()
+// 				globalRetxController.Remove(interestName)
+// 			case ndn.InterestResultData:
+// 				data := args.Data
+// 				content := data.Content().Join()
+// 				dataName := data.Name().String()
+
+// 				// Mark as received in Retx Controller (Lazy removal)
+// 				globalRetxController.Remove(dataName)
+
+// 				// Update Flow Stats & Rate (Decentralized)
+// 				flowCtx.RecordPacket(len(content), dataName, receiveTime)
+
+// 				stats.IncrementData()
+// 			}
+// 		})
+// }
+
+// // --- Main Flow Loop ---
+
+// func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.WaitGroup) {
+// 	defer wg.Done()
+
+// 	totalTimer := time.NewTimer(TOTAL_DURATION)
+// 	defer totalTimer.Stop()
+
+// 	// OPTIMIZATION B: Token Bucket Pacing
+// 	// Instead of sleep(1/rate), we accumulate tokens.
+// 	ticker := time.NewTicker(TICKER_INTERVAL)
+// 	defer ticker.Stop()
+
+// 	tokens := 0.0
+// 	sequenceNum := 0
+
+// 	// Max burst allows sending a few packets back-to-back if we fell behind slightly,
+// 	// but prevents dumping huge spikes.
+// 	const MAX_BURST = 5.0
+
+// 	log.Info(consumerTag, "Starting flow", "target", flowCtx.Prefix)
+
+// 	for {
+// 		select {
+// 		case <-totalTimer.C:
+// 			return
+// 		case <-flowCtx.doneCh:
+// 			return
+// 		case <-ticker.C:
+// 			// Refill tokens based on current rate
+// 			// Rate is packets/sec. Ticker is TICKER_INTERVAL.
+// 			// tokens += rate * interval_in_seconds
+// 			currentRate := flowCtx.GetRate()
+// 			tokens += currentRate * TICKER_INTERVAL.Seconds()
+
+// 			if tokens > MAX_BURST {
+// 				tokens = MAX_BURST
+// 			}
+
+// 			// OPTIMIZATION A: Remove Per-Packet Goroutines
+// 			// We loop here and send synchronously while we have tokens.
+// 			// This keeps the goroutine count constant (N flows = N goroutines).
+// 			for tokens >= 1.0 {
+// 				if sequenceNum >= MAX_PACKETS {
+// 					// Wait for completion or timeout
+// 					tokens = 0
+// 					break
+// 				}
+
+// 				sequenceNum++
+// 				tokens -= 1.0
+
+// 				// Direct call, no 'go' keyword
+// 				sendSingleInterest(app, stats, sequenceNum, flowCtx, false)
+// 			}
 // 		}
-// 		rc.mu.Unlock()
-
-// 		rc.stats.IncrementRetx()
-// 		log.Warn(consumerTag, "Retransmitting", "name", pkt.Name, "flow", pkt.Prefix)
-
-// 		// Send the packet again (isRetransmission = true)
-// 		go sendSingleInterest(rc.app, rc.stats, pkt.SequenceNum, pkt.FlowCtx, true)
 // 	}
 // }
 
-// var globalRetxController *RetransmissionController
-
-// // --- Helpers ---
-
-// func extractPrefix(name enc.Name) string {
-// 	if len(name) > 1 {
-// 		return name.Prefix(len(name) - 1).String()
+// func main() {
+// 	if len(os.Args) < 3 {
+// 		fmt.Fprintf(os.Stderr, "Usage: %s <node_name> <producer_range>\n", os.Args[0])
+// 		os.Exit(1)
 // 	}
-// 	return name.String()
+
+// 	nodeName := os.Args[1]
+// 	rangeStr := os.Args[2]
+// 	consumerNodeName = nodeName
+
+// 	targetPrefixes, err := parseProducerRange(rangeStr)
+// 	if err != nil {
+// 		log.Fatal(consumerTag, "Failed to parse producer range", "err", err)
+// 		return
+// 	}
+
+// 	// log.Default().SetLevel(log.LevelDebug)
+// 	log.Default().SetLevel(log.LevelInfo)
+// 	os.Setenv("NDN_CLIENT_TRANSPORT", "tcp://127.0.0.1:6363")
+
+// 	app := engine.NewBasicEngine(engine.NewDefaultFace())
+// 	err = app.Start()
+// 	if err != nil {
+// 		log.Fatal(consumerTag, "Unable to start engine", "err", err)
+// 		return
+// 	}
+// 	defer app.Stop()
+
+// 	stats := &Statistics{}
+
+// 	// Initialize Heap-based Retransmission Controller
+// 	globalRetxController = NewRetransmissionController(app, stats)
+// 	go globalRetxController.StartScheduler()
+// 	defer globalRetxController.Stop()
+
+// 	log.Info(consumerTag, "Starting Optimized NDN Consumer",
+// 		"nodeName", nodeName,
+// 		"targets", len(targetPrefixes),
+// 		"mode", "TokenBucket+HeapRetx")
+
+// 	var wg sync.WaitGroup
+// 	startTime := time.Now()
+// 	flowContexts := make([]*FlowContext, 0, len(targetPrefixes))
+
+// 	for _, prefix := range targetPrefixes {
+// 		wg.Add(1)
+// 		flowCtx := NewFlowContext(prefix)
+// 		flowContexts = append(flowContexts, flowCtx)
+// 		go runFlow(app, stats, flowCtx, &wg)
+// 	}
+
+// 	wg.Wait()
+// 	elapsed := time.Since(startTime)
+// 	log.Info(consumerTag, "All flows stopped", "elapsedTime", elapsed)
+
+// 	time.Sleep(1 * time.Second)
+// 	stats.Print()
+
+// 	log.Info(consumerTag, "=== Final Per-Flow Statistics ===")
+// 	for _, flowCtx := range flowContexts {
+// 		avgThroughput, totalBytes, duration := flowCtx.GetFinalStats()
+// 		log.Info(consumerTag, "Flow Summary",
+// 			"flow", flowCtx.Prefix,
+// 			"totalBytes", totalBytes,
+// 			"avgMbps", avgThroughput,
+// 			"duration", duration)
+// 	}
+// }
+
+// // Helpers
+
+// // extractSeqNum extracts the sequence number from a name string.
+// // Expected format: /prefix/node/[pd/<index>/|dt/]seq-<num>
+// // Returns -1 if parsing fails.
+// func extractSeqNum(nameStr string) int {
+// 	parts := strings.Split(nameStr, "/")
+// 	if len(parts) == 0 {
+// 		return -1
+// 	}
+// 	// Last component should be "seq-N"
+// 	lastPart := parts[len(parts)-1]
+// 	if !strings.HasPrefix(lastPart, "seq-") {
+// 		return -1
+// 	}
+// 	seqStr := strings.TrimPrefix(lastPart, "seq-")
+// 	seqNum, err := strconv.Atoi(seqStr)
+// 	if err != nil {
+// 		return -1
+// 	}
+// 	return seqNum
 // }
 
 // func parseProducerRange(rangeStr string) ([]string, error) {
@@ -1346,206 +1578,4 @@ func main() {
 // 		prefixes = append(prefixes, fmt.Sprintf("/pro%dapp", i))
 // 	}
 // 	return prefixes, nil
-// }
-
-// func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flowCtx *FlowContext, isRetransmission bool) {
-// 	name, err := enc.NameFromStr(flowCtx.Prefix)
-// 	if err != nil {
-// 		return
-// 	}
-
-// 	seqStr := fmt.Sprintf("seq-%d", sequenceNum)
-// 	name = name.Append(enc.NewStringComponent(0x08, seqStr))
-
-// 	intCfg := &ndn.InterestConfig{
-// 		MustBeFresh: true,
-// 		Lifetime:    optional.Some(INTEREST_LIFETIME),
-// 		Nonce:       utils.ConvertNonce(app.Timer().Nonce()),
-// 	}
-
-// 	interest, err := app.Spec().MakeInterest(name, intCfg, nil, nil)
-// 	if err != nil {
-// 		return
-// 	}
-
-// 	stats.IncrementSent()
-// 	interestName := interest.FinalName.String()
-// 	sendTime := time.Now()
-
-// 	// 1. Record for RTT calculation (only if NOT a retransmission, to avoid RTT ambiguity)
-// 	//    Standard TCP RTT sampling usually ignores retransmissions (Karn's Algorithm).
-// 	if !isRetransmission {
-// 		globalRTTTracker.RecordInterestSent(interestName, flowCtx.Prefix, sendTime)
-// 	}
-
-// 	// 2. Register for Retransmission Check (Update timestamp if it exists, add if new)
-// 	globalRetxController.Add(interestName, flowCtx.Prefix, sequenceNum, flowCtx)
-
-// 	err = app.Express(interest,
-// 		func(args ndn.ExpressCallbackArgs) {
-// 			receiveTime := time.Now()
-// 			switch args.Result {
-// 			case ndn.InterestResultNack:
-// 				stats.IncrementNack()
-// 				globalRTTTracker.RecordInterestTimeout(interestName)
-// 				globalRetxController.Remove(interestName) // Stop retransmitting
-// 			case ndn.InterestResultTimeout:
-// 				stats.IncrementTimeout()
-// 				globalRTTTracker.RecordInterestTimeout(interestName)
-// 				globalRetxController.Remove(interestName) // Engine gave up, we stop too
-// 			case ndn.InterestCancelled:
-// 				stats.IncrementCancel()
-// 				globalRTTTracker.RecordInterestTimeout(interestName)
-// 				globalRetxController.Remove(interestName)
-// 			case ndn.InterestResultData:
-// 				data := args.Data
-// 				content := data.Content().Join()
-// 				dataName := data.Name().String()
-// 				prefix := extractPrefix(data.Name())
-
-// 				// Stop Retransmission Tracking
-// 				globalRetxController.Remove(dataName)
-
-// 				// 1. RTO Calculation (Karn's algorithm implies we might skip this if it was retransmitted,
-// 				//    but our RTTTracker handles 'pendingInterests' logic where it deletes entry on first read.
-// 				//    If this was a retransmission, RecordDataReceived might return 0 if original send time was lost/overwritten.
-// 				//    However, for simplicity here, we just feed it.)
-// 				rttSample, mean, variance, rto := globalRTTTracker.RecordDataReceived(dataName, prefix, receiveTime)
-
-// 				// 2. Throughput & Rate Control Update
-// 				flowCtx.RecordPacket(len(content), rttSample)
-
-// 				log.Info(consumerTag, "Data Received",
-// 					"seq", sequenceNum,
-// 					"prefix", prefix,
-// 					"rtt", rttSample,
-// 					"MeanRTT", mean,
-// 					"Variance", variance,
-// 					"FinalRTO", rto,
-// 					"currentRate", flowCtx.GetRate())
-
-// 				stats.IncrementData()
-// 			}
-// 		})
-// }
-
-// func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.WaitGroup) {
-// 	defer wg.Done()
-
-// 	totalTimer := time.NewTimer(TOTAL_DURATION)
-// 	defer totalTimer.Stop()
-
-// 	sequenceNum := 0
-
-// 	log.Info(consumerTag, "Starting flow",
-// 		"target", flowCtx.Prefix,
-// 		"initRate", INIT_INTEREST_RATE,
-// 		"maxPackets", MAX_PACKETS)
-
-// 	for {
-// 		select {
-// 		case <-totalTimer.C:
-// 			log.Info(consumerTag, "Flow stopped (Timeout)", "target", flowCtx.Prefix)
-// 			return
-// 		case <-flowCtx.doneCh:
-// 			log.Info(consumerTag, "Flow stopped (Completed)", "target", flowCtx.Prefix)
-// 			return
-// 		default:
-// 			// Check if we have sent enough interests
-// 			if sequenceNum >= MAX_PACKETS {
-// 				// We have sent the max number of interests.
-// 				// Do NOT return yet. We must wait for the packets to be received (via doneCh)
-// 				// or for the hard timeout (via totalTimer).
-// 				time.Sleep(10 * time.Millisecond)
-// 				continue
-// 			}
-
-// 			// Dynamic Rate Control
-// 			currentRate := flowCtx.GetRate()
-
-// 			if currentRate <= 0 {
-// 				currentRate = 1
-// 			}
-
-// 			sleepDuration := time.Duration(float64(time.Second) / currentRate)
-// 			time.Sleep(sleepDuration)
-
-// 			sequenceNum++
-// 			// Send new packet (isRetransmission = false)
-// 			go sendSingleInterest(app, stats, sequenceNum, flowCtx, false)
-// 		}
-// 	}
-// }
-
-// func main() {
-// 	if len(os.Args) < 3 {
-// 		fmt.Fprintf(os.Stderr, "Usage: %s <node_name> <producer_range>\n", os.Args[0])
-// 		os.Exit(1)
-// 	}
-
-// 	nodeName := os.Args[1]
-// 	rangeStr := os.Args[2]
-
-// 	targetPrefixes, err := parseProducerRange(rangeStr)
-// 	if err != nil {
-// 		log.Fatal(consumerTag, "Failed to parse producer range", "err", err)
-// 		return
-// 	}
-
-// 	log.Default().SetLevel(log.LevelInfo)
-// 	os.Setenv("NDN_CLIENT_TRANSPORT", "tcp://127.0.0.1:6363")
-
-// 	app := engine.NewBasicEngine(engine.NewDefaultFace())
-// 	err = app.Start()
-// 	if err != nil {
-// 		log.Fatal(consumerTag, "Unable to start engine", "err", err)
-// 		return
-// 	}
-// 	defer app.Stop()
-
-// 	stats := &Statistics{}
-
-// 	// Initialize Retransmission Controller
-// 	globalRetxController = NewRetransmissionController(app, stats)
-// 	go globalRetxController.StartScheduler()
-// 	defer globalRetxController.Stop()
-
-// 	log.Info(consumerTag, "Starting NDN Consumer",
-// 		"nodeName", nodeName,
-// 		"targets", targetPrefixes,
-// 		"initRate", INIT_INTEREST_RATE,
-// 		"maxPackets", MAX_PACKETS,
-// 		"totalDuration", TOTAL_DURATION)
-
-// 	var wg sync.WaitGroup
-// 	startTime := time.Now()
-// 	flowContexts := make([]*FlowContext, 0, len(targetPrefixes))
-
-// 	for _, prefix := range targetPrefixes {
-// 		wg.Add(1)
-// 		flowCtx := NewFlowContext(prefix)
-// 		flowContexts = append(flowContexts, flowCtx)
-// 		go runFlow(app, stats, flowCtx, &wg)
-// 	}
-
-// 	wg.Wait()
-// 	elapsed := time.Since(startTime)
-// 	log.Info(consumerTag, "All flows stopped", "elapsedTime", elapsed)
-
-// 	// Wait a bit for any lingering logs/stats updates
-// 	time.Sleep(1 * time.Second)
-
-// 	stats.Print()
-// 	globalRTTTracker.PrintStats()
-
-// 	log.Info(consumerTag, "=== Final Per-Flow Statistics ===")
-// 	for _, flowCtx := range flowContexts {
-// 		avgThroughput, totalBytes, duration := flowCtx.GetFinalStats()
-// 		log.Info(consumerTag, "Flow Summary",
-// 			"flow", flowCtx.Prefix,
-// 			"totalBytes", totalBytes,
-// 			"timeTakenSec", duration,
-// 			"avgThroughput", avgThroughput,
-// 			"unit", "Mbps")
-// 	}
 // }
