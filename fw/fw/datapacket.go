@@ -1,4 +1,4 @@
-package datapacket
+package fw
 
 import (
 	"bytes"

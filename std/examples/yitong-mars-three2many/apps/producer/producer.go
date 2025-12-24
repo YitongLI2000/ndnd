@@ -43,7 +43,7 @@ func onInterest(args ndn.InterestHandlerArgs) {
 		// Path Discovery Mode
 		// Requirement: TierConverged = false, NodeConverged = true
 		// Payload: None (handled by NewDiscoveryPacket structure)
-		discoveryPacket := datapacket.NewDiscoveryPacket(false, true)
+		discoveryPacket := datapacket.NewDiscoveryPacket(false, false)
 
 		// fmt.Printf(">> PD Interest: %s | Replying: %s\n", name.String(), discoveryPacket.String())
 
