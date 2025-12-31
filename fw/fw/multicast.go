@@ -91,3 +91,16 @@ func (s *Multicast) AfterReceiveInterest(
 func (s *Multicast) BeforeSatisfyInterest(pitEntry table.PitEntry, inFace uint64) {
 	// This does nothing in Multicast
 }
+
+// TODO: added by yitong, nack pipeline
+// (AI GENERATED DESCRIPTION): Forwards a received NACK to all downstream faces (except the one it came from), following standard NFD behavior.
+func (s *Multicast) AfterReceiveNack(packet *defn.Pkt, pitEntry table.PitEntry, inFace uint64, nackReason uint64) {
+	core.Log.Trace(s, "AfterReceiveNack", "name", packet.Name, "reason", nackReason, "inFace", inFace)
+
+	// Forward NACK to all downstream faces (in-records) except the incoming face
+	for faceID := range pitEntry.InRecords() {
+		if faceID != inFace {
+			s.SendNack(packet, pitEntry, faceID, inFace, nackReason)
+		}
+	}
+}

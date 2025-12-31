@@ -72,10 +72,13 @@ type Thread struct {
 	HasQuit       chan interface{}
 
 	// Counters
-	nInInterests          atomic.Uint64
-	nInData               atomic.Uint64
-	nOutInterests         atomic.Uint64
-	nOutData              atomic.Uint64
+	nInInterests  atomic.Uint64
+	nInData       atomic.Uint64
+	nOutInterests atomic.Uint64
+	nOutData      atomic.Uint64
+	// TODO: added by yitong, nack pipeline
+	nInNacks              atomic.Uint64
+	nOutNacks             atomic.Uint64
 	nSatisfiedInterests   atomic.Uint64
 	nUnsatisfiedInterests atomic.Uint64
 	nCsHits               atomic.Uint64
@@ -108,12 +111,15 @@ func (t *Thread) GetID() int {
 // Counters returns the counters for this forwarding thread
 func (t *Thread) Counters() defn.FWThreadCounters {
 	return defn.FWThreadCounters{
-		NPitEntries:           t.pitCS.PitSize(),
-		NCsEntries:            t.pitCS.CsSize(),
-		NInInterests:          t.nInInterests.Load(),
-		NInData:               t.nInData.Load(),
-		NOutInterests:         t.nOutInterests.Load(),
-		NOutData:              t.nOutData.Load(),
+		NPitEntries:   t.pitCS.PitSize(),
+		NCsEntries:    t.pitCS.CsSize(),
+		NInInterests:  t.nInInterests.Load(),
+		NInData:       t.nInData.Load(),
+		NOutInterests: t.nOutInterests.Load(),
+		NOutData:      t.nOutData.Load(),
+		// TODO: added by yitong, nack pipeline
+		NInNacks:              t.nInNacks.Load(),
+		NOutNacks:             t.nOutNacks.Load(),
 		NSatisfiedInterests:   t.nSatisfiedInterests.Load(),
 		NUnsatisfiedInterests: t.nUnsatisfiedInterests.Load(),
 		NCsHits:               t.nCsHits.Load(),
@@ -136,7 +142,11 @@ func (t *Thread) Run() {
 	for !core.ShouldQuit {
 		select {
 		case pkt := <-t.pending:
-			if pkt.L3.Interest != nil {
+			// TODO: added by yitong, nack pipeline
+			// NACKs are Interest packets with NACK indication, so check NackReason first
+			if pkt.NackReason != nil && pkt.L3.Interest != nil {
+				t.processIncomingNack(pkt)
+			} else if pkt.L3.Interest != nil {
 				t.processIncomingInterest(pkt)
 			} else if pkt.L3.Data != nil {
 				t.processIncomingData(pkt)
@@ -171,6 +181,16 @@ func (t *Thread) QueueData(data *defn.Pkt) {
 	case t.pending <- data:
 	default:
 		core.Log.Error(t, "Data dropped due to full queue")
+	}
+}
+
+// TODO: added by yitong, nack pipeline
+// QueueNack queues a NACK packet for processing by this forwarding thread.
+func (t *Thread) QueueNack(nack *defn.Pkt) {
+	select {
+	case t.pending <- nack:
+	default:
+		core.Log.Error(t, "NACK dropped due to full queue")
 	}
 }
 
@@ -426,6 +446,72 @@ func (t *Thread) finalizeInterest(pitEntry table.PitEntry) {
 	}
 }
 
+// TODO: added by yitong, nack pipeline
+// (AI GENERATED DESCRIPTION): Processes an incoming NACK packet by validating it, finding the corresponding PIT entry via PIT token or name, verifying it matches an out-record, updating counters, and invoking the strategy's AfterReceiveNack handler.
+func (t *Thread) processIncomingNack(packet *defn.Pkt) {
+	interest := packet.L3.Interest
+	if interest == nil || packet.NackReason == nil {
+		panic("processIncomingNack called with non-NACK packet")
+	}
+
+	// Get incoming face
+	incomingFace := dispatch.GetFace(packet.IncomingFaceID)
+	if incomingFace == nil {
+		core.Log.Error(t, "NACK has non-existent incoming face", "faceid", packet.IncomingFaceID, "name", packet.Name)
+		return
+	}
+
+	// Update counter
+	t.nInNacks.Add(1)
+
+	// Log PIT token (if any)
+	core.Log.Trace(t, "OnIncomingNack", "name", packet.Name, "faceid", incomingFace.FaceID(), "reason", *packet.NackReason, "pittoken", len(packet.PitToken))
+
+	// Find PIT entry using PIT token (preferred) or name (fallback)
+	var pitEntry table.PitEntry
+	if len(packet.PitToken) == 6 {
+		// Decode PIT token: uint16 (thread ID) + uint32 (PIT entry token)
+		token := binary.BigEndian.Uint32(packet.PitToken[2:6])
+		// Find PIT entry by token
+		// Note: We use FindInterestPrefixMatchByDataEnc with token for lookup
+		// Since we don't have Data, we'll need to use a different approach
+		// For now, we'll search by name and verify token matches
+		pitEntry = t.pitCS.FindInterestExactMatchEnc(interest)
+		if pitEntry != nil && pitEntry.Token() != token {
+			// Token doesn't match, this NACK might be for a different PIT entry
+			core.Log.Trace(t, "NACK PIT token mismatch", "name", packet.Name, "expected", pitEntry.Token(), "got", token)
+			pitEntry = nil
+		}
+	}
+
+	// Fallback to name-based lookup if no PIT token or token didn't match
+	if pitEntry == nil {
+		pitEntry = t.pitCS.FindInterestExactMatchEnc(interest)
+	}
+
+	if pitEntry == nil {
+		// No matching PIT entry - unsolicited NACK, drop
+		core.Log.Trace(t, "Unsolicited NACK (no PIT entry)", "name", packet.Name)
+		return
+	}
+
+	// Verify that the NACK corresponds to an out-record from the incoming face
+	// This prevents spoofing - a NACK should only come from a face we sent the Interest to
+	_, hasOutRecord := pitEntry.OutRecords()[packet.IncomingFaceID]
+	if !hasOutRecord {
+		core.Log.Trace(t, "NACK from face with no out-record", "name", packet.Name, "faceid", packet.IncomingFaceID)
+		// Still process it, but log the anomaly
+	}
+
+	// Get strategy for name
+	strategyName := table.FibStrategyTable.FindStrategyEnc(interest.Name())
+	strategy := t.strategies[strategyName.Hash()]
+
+	// Invoke strategy's AfterReceiveNack pipeline
+	// Strategy can decide to forward NACK downstream, try alternate nexthop, or drop
+	strategy.AfterReceiveNack(packet, pitEntry, incomingFace.FaceID(), *packet.NackReason)
+}
+
 // (AI GENERATED DESCRIPTION): Processes an incoming Data packet by validating it, updating counters, enforcing scope rules, inserting it into the content store, matching and satisfying any pending PIT entries through the appropriate strategy, and forwarding the data to the corresponding downstream faces.
 func (t *Thread) processIncomingData(packet *defn.Pkt) {
 	data := packet.L3.Data
@@ -576,4 +662,61 @@ func (t *Thread) processOutgoingData(
 		PitToken: pitToken,
 		InFace:   inFace,
 	})
+}
+
+// TODO: added by yitong, nack pipeline
+// (AI GENERATED DESCRIPTION): Sends a NACK packet to a specified next‑hop face, performing /localhost scope checks, logging the event, updating outgoing NACK counters, encoding the NACK in LpPacket, and delivering the packet via the outgoing face.
+func (t *Thread) processOutgoingNack(
+	packet *defn.Pkt,
+	pitEntry table.PitEntry,
+	nexthop uint64,
+	inFace uint64,
+	reason uint64,
+) bool {
+	interest := packet.L3.Interest
+	if interest == nil {
+		panic("processOutgoingNack called with non-Interest packet")
+	}
+
+	core.Log.Trace(t, "OnOutgoingNack", "name", packet.Name, "faceid", nexthop, "reason", reason)
+
+	// Get outgoing face
+	outgoingFace := dispatch.GetFace(nexthop)
+	if outgoingFace == nil {
+		core.Log.Error(t, "Non-existent nexthop for NACK", "name", packet.Name, "faceid", nexthop)
+		return false
+	}
+
+	// Check if violates /localhost
+	if outgoingFace.Scope() == defn.NonLocal && len(packet.Name) > 0 && packet.Name[0].Equal(enc.LOCALHOST) {
+		core.Log.Warn(t, "NACK cannot be sent to non-local face since violates /localhost scope", "name", packet.Name, "faceid", nexthop)
+		return false
+	}
+
+	// Update counters
+	t.nOutNacks.Add(1)
+
+	// Create a copy of the packet with NACK reason set
+	nackPacket := *packet
+	nackPacket.NackReason = &reason
+
+	// Make PIT token if needed (for downstream forwarding)
+	var pitToken []byte
+	if inRecord, ok := pitEntry.InRecords()[nexthop]; ok && len(inRecord.PitToken) > 0 {
+		pitToken = inRecord.PitToken
+	} else {
+		// Generate PIT token for this thread
+		pitToken = make([]byte, 6)
+		binary.BigEndian.PutUint16(pitToken, uint16(t.threadID))
+		binary.BigEndian.PutUint32(pitToken[2:], pitEntry.Token())
+	}
+
+	// Send on outgoing face
+	outgoingFace.SendPacket(dispatch.OutPkt{
+		Pkt:      &nackPacket,
+		PitToken: pitToken,
+		InFace:   inFace,
+	})
+
+	return true
 }

@@ -174,7 +174,11 @@ func sendPacket(l *NDNLPLinkService, out dispatch.OutPkt) {
 	wire := pkt.Raw
 
 	// Counters
-	if pkt.L3.Interest != nil {
+	// TODO: added by yitong, nack pipeline
+	// Note: NACKs are Interest packets with NACK indication, so check NackReason first
+	if pkt.NackReason != nil && pkt.L3.Interest != nil {
+		// NACK counter is handled in forwarding thread, not here
+	} else if pkt.L3.Interest != nil {
 		l.nOutInterests++
 	} else if pkt.L3.Data != nil {
 		l.nOutData++
@@ -254,6 +258,14 @@ func sendPacket(l *NDNLPLinkService, out dispatch.OutPkt) {
 		// Congestion marking
 		if congestionMark.IsSet() {
 			fragment.CongestionMark = congestionMark
+		}
+
+		// TODO: added by yitong, nack pipeline
+		// NACK indication (if this is a NACK packet)
+		if pkt.NackReason != nil {
+			fragment.Nack = &defn.FwNetworkNack{
+				Reason: *pkt.NackReason,
+			}
 		}
 
 		// Encode final LP frame
@@ -346,6 +358,13 @@ func (l *NDNLPLinkService) handleIncomingFrame(frame []byte) {
 		// See the generated code for defn.FwLpPacket
 		pkt.PitToken = LP.PitToken
 
+		// TODO: added by yitong, nack pipeline
+		// Check for NACK indication in LpPacket
+		if LP.Nack != nil {
+			reason := LP.Nack.Reason
+			pkt.NackReason = &reason
+		}
+
 		// Parse inner packet in place
 		L3, err := defn.ParseFwPacket(enc.NewWireView(fragment), false)
 		if err != nil {
@@ -356,7 +375,12 @@ func (l *NDNLPLinkService) handleIncomingFrame(frame []byte) {
 	}
 
 	// Dispatch and update counters
-	if pkt.L3.Interest != nil {
+	// TODO: added by yitong, nack pipeline
+	// NACKs are Interest packets with NACK indication, so check NackReason first
+	if pkt.NackReason != nil && pkt.L3.Interest != nil {
+		// This is a NACK packet
+		l.dispatchNack(pkt)
+	} else if pkt.L3.Interest != nil {
 		l.nInInterests++
 		l.dispatchInterest(pkt)
 	} else if pkt.L3.Data != nil {

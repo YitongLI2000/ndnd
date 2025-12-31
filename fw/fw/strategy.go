@@ -34,6 +34,12 @@ type Strategy interface {
 		pitEntry table.PitEntry,
 		inFace uint64,
 		nexthops []*table.FibNextHopEntry)
+	// TODO: added by yitong, nack pipeline
+	AfterReceiveNack(
+		packet *defn.Pkt,
+		pitEntry table.PitEntry,
+		inFace uint64,
+		nackReason uint64)
 	BeforeSatisfyInterest(
 		pitEntry table.PitEntry,
 		inFace uint64)
@@ -102,4 +108,18 @@ func (s *StrategyBase) SendData(
 		pitEntry.RemoveInRecord(nexthop)
 	}
 	s.thread.processOutgoingData(packet, nexthop, pitToken, inFace)
+}
+
+// TODO: added by yitong, nack pipeline
+// SendNack sends a NACK packet on the specified face.
+func (s *StrategyBase) SendNack(
+	packet *defn.Pkt,
+	pitEntry table.PitEntry,
+	nexthop uint64,
+	inFace uint64,
+	reason uint64,
+) bool {
+	//! NackReason is set when this packet is a NACK (Network NACK).
+	// It contains the NACK reason code (0 = None, 50 = Congestion, 100 = Duplicate, 150 = NoRoute).
+	return s.thread.processOutgoingNack(packet, pitEntry, nexthop, inFace, reason)
 }

@@ -18,6 +18,7 @@ type FWThread interface {
 
 	QueueData(packet *defn.Pkt)
 	QueueInterest(packet *defn.Pkt)
+	QueueNack(packet *defn.Pkt)
 
 	Counters() defn.FWThreadCounters
 }

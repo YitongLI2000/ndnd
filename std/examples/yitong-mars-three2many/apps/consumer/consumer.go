@@ -238,6 +238,10 @@ func (f *FlowContext) OnNack(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// TODO: added by yitong, nack pipeline
+	// Simple printf for debugging
+	fmt.Printf("[NACK DEBUG] Received NACK for: %s, Mode: %v, Prefix: %s\n", name, f.Mode, f.Prefix)
+
 	log.Debug(consumerTag, "OnNack", "name", name, "mode", f.Mode)
 
 	delete(f.pendingSends, name)
@@ -907,14 +911,27 @@ func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.W
 }
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <node_name> <producer_range>\n", os.Args[0])
+	if len(os.Args) < 4 {
+		fmt.Fprintf(os.Stderr, "Usage: %s <node_name> <producer_range> <initialMode>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  initialMode must be either \"ModePD\" or \"ModeDT\"\n")
 		os.Exit(1)
 	}
 
 	nodeName := os.Args[1]
 	rangeStr := os.Args[2]
+	modeStr := os.Args[3]
 	consumerNodeName = nodeName
+
+	// Parse initial mode from command line argument
+	switch modeStr {
+	case "ModePD":
+		initialMode = ModePD
+	case "ModeDT":
+		initialMode = ModeDT
+	default:
+		fmt.Fprintf(os.Stderr, "Error: invalid initialMode \"%s\". Must be \"ModePD\" or \"ModeDT\"\n", modeStr)
+		os.Exit(1)
+	}
 
 	if strings.HasPrefix(nodeName, "con") {
 		idxStr := strings.TrimPrefix(nodeName, "con")
@@ -929,7 +946,9 @@ func main() {
 		return
 	}
 
-	log.Default().SetLevel(log.LevelDebug)
+	// log.Default().SetLevel(log.LevelDebug)
+	log.Default().SetLevel(log.LevelInfo)
+
 	os.Setenv("NDN_CLIENT_TRANSPORT", "tcp://127.0.0.1:6363")
 
 	app := engine.NewBasicEngine(engine.NewDefaultFace())

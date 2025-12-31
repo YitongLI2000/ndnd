@@ -6,13 +6,17 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	enc "github.com/named-data/ndnd/std/encoding"
 	"github.com/named-data/ndnd/std/engine"
+	engine_basic "github.com/named-data/ndnd/std/engine/basic"
 	"github.com/named-data/ndnd/std/log"
 	"github.com/named-data/ndnd/std/ndn"
+	spec "github.com/named-data/ndnd/std/ndn/spec_2022"
 	"github.com/named-data/ndnd/std/object"         // Imported for object.NewClient
 	"github.com/named-data/ndnd/std/object/storage" // Imported for storage.NewMemoryStore
 	sec_pib "github.com/named-data/ndnd/std/security/pib"
@@ -21,6 +25,27 @@ import (
 
 var app ndn.Engine
 var pib *sec_pib.SqlitePib
+
+// extractSeqNum extracts the sequence number from a name string.
+// Expected format: /prefix/node/[pd/<index>/|dt/]seq-<num>
+// Returns -1 if parsing fails.
+func extractSeqNum(nameStr string) int {
+	parts := strings.Split(nameStr, "/")
+	if len(parts) == 0 {
+		return -1
+	}
+	// Last component should be "seq-N"
+	lastPart := parts[len(parts)-1]
+	if !strings.HasPrefix(lastPart, "seq-") {
+		return -1
+	}
+	seqStr := strings.TrimPrefix(lastPart, "seq-")
+	seqNum, err := strconv.Atoi(seqStr)
+	if err != nil {
+		return -1
+	}
+	return seqNum
+}
 
 func onInterest(args ndn.InterestHandlerArgs) {
 	interest := args.Interest
@@ -34,6 +59,61 @@ func onInterest(args ndn.InterestHandlerArgs) {
 	}
 
 	mode := name.At(2).String()
+
+	// TODO: added by yitong, nack pipeline
+	// Check if this is seq-15000 in dt mode - send NACK for testing
+	if mode == "dt" {
+		seqNum := extractSeqNum(name.String())
+		if seqNum == 15000 {
+			log.Info(nil, "Sending NACK for seq-15000 (testing)", "name", name.String())
+
+			// Create an LpPacket with NACK indication
+			// The Fragment should contain the Interest packet
+			interestWire := args.RawInterest
+			if len(interestWire) == 0 {
+				// If RawInterest is empty, we need to encode the interest
+				// For now, we'll use the wire from the interest if available
+				log.Warn(nil, "RawInterest is empty, cannot create NACK")
+				return
+			}
+
+			// Create LpPacket with NACK
+			lpPkt := &spec.Packet{
+				LpPacket: &spec.LpPacket{
+					Fragment: interestWire,
+					Nack: &spec.NetworkNack{
+						Reason: spec.NackReasonNoRoute, // Use NoRoute reason for testing
+					},
+					PitToken: args.PitToken,
+				},
+			}
+
+			// Encode the LpPacket
+			encoder := spec.PacketEncoder{}
+			encoder.Init(lpPkt)
+			nackWire := encoder.Encode(lpPkt)
+
+			if nackWire == nil {
+				log.Error(nil, "Failed to encode NACK packet")
+				return
+			}
+
+			// Send NACK directly via the engine's face
+			// We need to access the face from the engine
+			if basicEngine, ok := app.(*engine_basic.Engine); ok {
+				err := basicEngine.Face().Send(nackWire)
+				if err != nil {
+					log.Error(nil, "Failed to send NACK", "err", err)
+				} else {
+					log.Info(nil, "NACK sent successfully", "name", name.String(), "reason", spec.NackReasonNoRoute)
+				}
+			} else {
+				log.Error(nil, "Cannot access engine face to send NACK")
+			}
+			return
+		}
+	}
+
 	var content []byte
 	var err error
 

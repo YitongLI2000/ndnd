@@ -24,4 +24,10 @@ type Pkt struct {
 
 	IncomingFaceID uint64
 	NextHopFaceID  optional.Optional[uint64]
+
+	// TODO: added by yitong, nack pipeline
+	// NackReason is set when this packet is a NACK (Network NACK).
+	// It contains the NACK reason code (0 = None, 50 = Congestion, 100 = Duplicate, 150 = NoRoute).
+	// If nil, this packet is not a NACK.
+	NackReason *uint64
 }

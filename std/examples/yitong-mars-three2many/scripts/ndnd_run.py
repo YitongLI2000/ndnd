@@ -19,7 +19,7 @@ import sys
 #    - 1: Only con0 is active.
 #    - 2: con0 and con1 are active.
 #    - 3: con0, con1, and con2 are active.
-NUM_ACTIVE_CONSUMERS = 1
+NUM_ACTIVE_CONSUMERS = 3
 
 # 2. Number of Producers per Consumer (1 to 5)
 #    - This determines how many producers each active consumer requests data from.
@@ -58,48 +58,48 @@ NODES = [
 
 LINKS = [
     # Producers to Edges (Lossless)
-    ('pro0', 'edge0', 50, '1ms', 500, 0), ('pro1', 'edge1', 50, '1ms', 500, 0),
-    ('pro2', 'edge2', 50, '1ms', 500, 0), ('pro3', 'edge3', 50, '1ms', 500, 0),
-    ('pro4', 'edge4', 50, '1ms', 500, 0), ('pro5', 'edge5', 50, '1ms', 500, 0),
-    ('pro6', 'edge6', 50, '1ms', 500, 0), ('pro7', 'edge7', 50, '1ms', 500, 0),
-    ('pro8', 'edge8', 50, '1ms', 500, 0), ('pro9', 'edge9', 50, '1ms', 500, 0),
-    ('pro10', 'edge10', 50, '1ms', 500, 0), ('pro11', 'edge11', 50, '1ms', 500, 0),
-    ('pro12', 'edge12', 50, '1ms', 500, 0), ('pro13', 'edge13', 50, '1ms', 500, 0),
-    ('pro14', 'edge14', 50, '1ms', 500, 0), 
+    ('pro0', 'edge0', 40, '1ms', 500, 0), ('pro1', 'edge1', 40, '1ms', 500, 0),
+    ('pro2', 'edge2', 40, '1ms', 500, 0), ('pro3', 'edge3', 40, '1ms', 500, 0),
+    ('pro4', 'edge4', 40, '1ms', 500, 0), ('pro5', 'edge5', 40, '1ms', 500, 0),
+    ('pro6', 'edge6', 40, '1ms', 500, 0), ('pro7', 'edge7', 40, '1ms', 500, 0),
+    ('pro8', 'edge8', 40, '1ms', 500, 0), ('pro9', 'edge9', 40, '1ms', 500, 0),
+    ('pro10', 'edge10', 40, '1ms', 500, 0), ('pro11', 'edge11', 40, '1ms', 500, 0),
+    ('pro12', 'edge12', 40, '1ms', 500, 0), ('pro13', 'edge13', 40, '1ms', 500, 0),
+    ('pro14', 'edge14', 40, '1ms', 500, 0), 
     
     # Edges to Core0 (Edges 0-4)
-    ('edge0', 'core0', 50, '1ms', 500, 0), ('edge1', 'core0', 50, '1ms', 500, 0),
-    ('edge2', 'core0', 50, '1ms', 500, 0), ('edge3', 'core0', 50, '1ms', 500, 0),
-    ('edge4', 'core0', 50, '1ms', 500, 0),
+    ('edge0', 'core0', 40, '1ms', 500, 0), ('edge1', 'core0', 40, '1ms', 500, 0),
+    ('edge2', 'core0', 40, '1ms', 500, 0), ('edge3', 'core0', 40, '1ms', 500, 0),
+    ('edge4', 'core0', 40, '1ms', 500, 0),
     # Edges to Core1 (Edges 5-9)
-    ('edge5', 'core1', 50, '1ms', 500, 0), ('edge6', 'core1', 50, '1ms', 500, 0),
-    ('edge7', 'core1', 50, '1ms', 500, 0), ('edge8', 'core1', 50, '1ms', 500, 0),
-    ('edge9', 'core1', 50, '1ms', 500, 0),
+    ('edge5', 'core1', 40, '1ms', 500, 0), ('edge6', 'core1', 40, '1ms', 500, 0),
+    ('edge7', 'core1', 40, '1ms', 500, 0), ('edge8', 'core1', 40, '1ms', 500, 0),
+    ('edge9', 'core1', 40, '1ms', 500, 0),
     # Edges to Core2 (Edges 10-14)
-    ('edge10', 'core2', 50, '1ms', 500, 0), ('edge11', 'core2', 50, '1ms', 500, 0),
-    ('edge12', 'core2', 50, '1ms', 500, 0), ('edge13', 'core2', 50, '1ms', 500, 0),
-    ('edge14', 'core2', 50, '1ms', 500, 0),
+    ('edge10', 'core2', 40, '1ms', 500, 0), ('edge11', 'core2', 40, '1ms', 500, 0),
+    ('edge12', 'core2', 40, '1ms', 500, 0), ('edge13', 'core2', 40, '1ms', 500, 0),
+    ('edge14', 'core2', 40, '1ms', 500, 0),
 
     # Consumer to Cores (With Configurable Loss)
     # con0 -> Mesh
-    ('con0', 'core0', 50, '1ms', 500, CON_TO_CORE_LOSS), ('con0', 'core1', 50, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con0', 'core2', 50, '1ms', 500, CON_TO_CORE_LOSS), ('con0', 'core3', 50, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con0', 'core4', 50, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con0', 'core0', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con0', 'core1', 40, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con0', 'core2', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con0', 'core3', 40, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con0', 'core4', 40, '1ms', 500, CON_TO_CORE_LOSS),
     # con1 -> Mesh
-    ('con1', 'core0', 50, '1ms', 500, CON_TO_CORE_LOSS), ('con1', 'core1', 50, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con1', 'core2', 50, '1ms', 500, CON_TO_CORE_LOSS), ('con1', 'core3', 50, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con1', 'core4', 50, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con1', 'core0', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con1', 'core1', 40, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con1', 'core2', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con1', 'core3', 40, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con1', 'core4', 40, '1ms', 500, CON_TO_CORE_LOSS),
     # con2 -> Mesh
-    ('con2', 'core0', 50, '1ms', 500, CON_TO_CORE_LOSS), ('con2', 'core1', 50, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con2', 'core2', 50, '1ms', 500, CON_TO_CORE_LOSS), ('con2', 'core3', 50, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con2', 'core4', 50, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con2', 'core0', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con2', 'core1', 40, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con2', 'core2', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con2', 'core3', 40, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con2', 'core4', 40, '1ms', 500, CON_TO_CORE_LOSS),
 
     # Core Mesh (Lossless)
-    ('core0', 'core1', 50, '1ms', 500, 0), ('core0', 'core2', 50, '1ms', 500, 0),
-    ('core0', 'core3', 50, '1ms', 500, 0), ('core0', 'core4', 50, '1ms', 500, 0),
-    ('core1', 'core2', 50, '1ms', 500, 0), ('core1', 'core3', 50, '1ms', 500, 0),
-    ('core1', 'core4', 50, '1ms', 500, 0), ('core2', 'core3', 50, '1ms', 500, 0),
-    ('core2', 'core4', 50, '1ms', 500, 0), ('core3', 'core4', 50, '1ms', 500, 0)
+    ('core0', 'core1', 40, '1ms', 500, 0), ('core0', 'core2', 40, '1ms', 500, 0),
+    ('core0', 'core3', 40, '1ms', 500, 0), ('core0', 'core4', 40, '1ms', 500, 0),
+    ('core1', 'core2', 40, '1ms', 500, 0), ('core1', 'core3', 40, '1ms', 500, 0),
+    ('core1', 'core4', 40, '1ms', 500, 0), ('core2', 'core3', 40, '1ms', 500, 0),
+    ('core2', 'core4', 40, '1ms', 500, 0), ('core3', 'core4', 40, '1ms', 500, 0)
 ]
 
 # ==============================================================================
@@ -358,7 +358,7 @@ def run_applications(net):
             
         print(f"Starting {c_name} -> Producers [{range_arg}]")
         # Arguments: <node_name> <producer_range>
-        c_node.cmd(f'{c_bin} {c_name}app {range_arg} > {c_log} 2>&1 &')
+        c_node.cmd(f'{c_bin} {c_name}app {range_arg} ModeDT > {c_log} 2>&1 &')
     
     print("All applications running.")
 

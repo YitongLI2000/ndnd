@@ -280,3 +280,33 @@ func (l *linkServiceBase) dispatchData(pkt *defn.Pkt) {
 	core.Log.Trace(l, "Dispatched Data", "thread", thread)
 	dispatch.GetFWThread(thread).QueueData(pkt)
 }
+
+// TODO: added by yitong, nack pipeline
+// (AI GENERATED DESCRIPTION): Routes a NACK packet to the correct forwarding thread by examining its PIT token (preferred) or hashing its name, and enqueuing it for processing.
+func (l *linkServiceBase) dispatchNack(pkt *defn.Pkt) {
+	if pkt.L3.Interest == nil || pkt.NackReason == nil {
+		panic("dispatchNack called with packet that is not a NACK")
+	}
+
+	// Store name for easy access
+	pkt.Name = pkt.L3.Interest.NameV
+
+	// Prefer PIT token routing (if present) for direct dispatch to owning thread
+	if len(pkt.PitToken) == 6 {
+		thread := binary.BigEndian.Uint16(pkt.PitToken)
+		fwThread := dispatch.GetFWThread(int(thread))
+		if fwThread == nil {
+			core.Log.Error(l, "Invalid PIT token attached to NACK packet")
+			// Fall through to name-based routing
+		} else {
+			core.Log.Trace(l, "Dispatched NACK via PIT token", "thread", thread, "reason", *pkt.NackReason)
+			fwThread.QueueNack(pkt)
+			return
+		}
+	}
+
+	// Fallback to name-based routing if no PIT token
+	thread := fw.HashNameToFwThread(pkt.Name)
+	core.Log.Trace(l, "Dispatched NACK via name hash", "thread", thread, "reason", *pkt.NackReason)
+	dispatch.GetFWThread(thread).QueueNack(pkt)
+}

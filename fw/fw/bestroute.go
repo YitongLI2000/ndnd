@@ -9,6 +9,8 @@ package fw
 
 import (
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/named-data/ndnd/fw/core"
@@ -145,6 +147,19 @@ func (s *BestRoute) BeforeSatisfyInterest(pitEntry table.PitEntry, inFace uint64
 	// This does nothing in BestRoute
 }
 
+// TODO: added by yitong, nack pipeline
+// (AI GENERATED DESCRIPTION): Forwards a received NACK to all downstream faces (except the one it came from), following standard NFD behavior.
+func (s *BestRoute) AfterReceiveNack(packet *defn.Pkt, pitEntry table.PitEntry, inFace uint64, nackReason uint64) {
+	core.Log.Trace(s, "AfterReceiveNack", "name", packet.Name, "reason", nackReason, "inFace", inFace)
+
+	// Forward NACK to all downstream faces (in-records) except the incoming face
+	for faceID := range pitEntry.InRecords() {
+		if faceID != inFace {
+			s.SendNack(packet, pitEntry, faceID, inFace, nackReason)
+		}
+	}
+}
+
 // getPrefixKey extracts the prefix key from a packet name.
 // Uses the first component as the prefix key.
 func getPrefixKey(name enc.Name) string {
@@ -152,4 +167,25 @@ func getPrefixKey(name enc.Name) string {
 		return name[0].String()
 	}
 	return "/"
+}
+
+// extractSeqNum extracts the sequence number from a name string.
+// Expected format: /prefix/node/[pd/<index>/|dt/]seq-<num>
+// Returns -1 if parsing fails.
+func extractSeqNum(nameStr string) int {
+	parts := strings.Split(nameStr, "/")
+	if len(parts) == 0 {
+		return -1
+	}
+	// Last component should be "seq-N"
+	lastPart := parts[len(parts)-1]
+	if !strings.HasPrefix(lastPart, "seq-") {
+		return -1
+	}
+	seqStr := strings.TrimPrefix(lastPart, "seq-")
+	seqNum, err := strconv.Atoi(seqStr)
+	if err != nil {
+		return -1
+	}
+	return seqNum
 }
