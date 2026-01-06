@@ -40,6 +40,11 @@ type Strategy interface {
 		pitEntry table.PitEntry,
 		inFace uint64,
 		nackReason uint64)
+	// TODO: added by yitong, looped interests pipeline
+	AfterReceiveLoopedInterest(
+		packet *defn.Pkt,
+		pitEntry table.PitEntry,
+		inFace uint64)
 	BeforeSatisfyInterest(
 		pitEntry table.PitEntry,
 		inFace uint64)

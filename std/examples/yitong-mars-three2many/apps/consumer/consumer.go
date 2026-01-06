@@ -37,7 +37,8 @@ const (
 
 // --- Path Discovery (PD) Configuration ---
 const (
-	PD_INIT_RATE        = 500.0
+	// Max pd rate is 20000 interests/sec
+	PD_INIT_RATE        = 2000.0
 	PD_INIT_RTO         = 200.0
 	PD_REHEARSAL_BUDGET = 20
 )

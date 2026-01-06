@@ -104,3 +104,10 @@ func (s *Multicast) AfterReceiveNack(packet *defn.Pkt, pitEntry table.PitEntry, 
 		}
 	}
 }
+
+// TODO: added by yitong, looped interests pipeline
+// (AI GENERATED DESCRIPTION): Handles looped interests by dropping them (default NFD behavior).
+func (s *Multicast) AfterReceiveLoopedInterest(packet *defn.Pkt, pitEntry table.PitEntry, inFace uint64) {
+	core.Log.Trace(s, "AfterReceiveLoopedInterest", "name", packet.Name, "inFace", inFace)
+	// Default behavior: drop the looped Interest (handled by thread.go return)
+}

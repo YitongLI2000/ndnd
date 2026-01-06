@@ -267,8 +267,16 @@ func (t *Thread) processIncomingInterest(packet *defn.Pkt) {
 	// read into this, looks like this one will have to be manually changed
 	pitEntry, isDuplicate := t.pitCS.InsertInterest(interest, fhName, incomingFace.FaceID())
 	if isDuplicate {
-		// Interest loop - since we don't use Nacks, just drop
+		// Interest loop detected - invoke strategy's AfterReceiveLoopedInterest pipeline
 		core.Log.Trace(t, "Interest is looping (PIT)", "name", packet.Name)
+
+		// Get strategy for name
+		strategyName := table.FibStrategyTable.FindStrategyEnc(interest.Name())
+		strategy := t.strategies[strategyName.Hash()]
+
+		// Invoke strategy's AfterReceiveLoopedInterest pipeline
+		// Strategy can decide to drop, send NACK, or handle the loop differently
+		strategy.AfterReceiveLoopedInterest(packet, pitEntry, incomingFace.FaceID())
 		return
 	}
 
