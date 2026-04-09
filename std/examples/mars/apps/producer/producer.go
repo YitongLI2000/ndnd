@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"ndnd-mars-three/internal/datapacket"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -11,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/named-data/ndnd/std/datapacket"
 	enc "github.com/named-data/ndnd/std/encoding"
 	"github.com/named-data/ndnd/std/engine"
 	"github.com/named-data/ndnd/std/log"

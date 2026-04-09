@@ -24,3 +24,4 @@ __pycache__/
 *.log
 /temp/
 *.wasm
+.codex

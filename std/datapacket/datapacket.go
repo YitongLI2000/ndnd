@@ -6,6 +6,14 @@ import (
 	"fmt"
 )
 
+// Data packet layout parameters.
+// Change DataPacketValueCount to adjust DT payload vector length globally.
+const (
+	DataPacketValueCount = 750
+	float64SizeBytes     = 8
+	dataPacketMetaFields = 2 // InterestQsf + DataQsf
+)
+
 // -----------------------------------------------------------------------------
 // Data Transmission Packet (DT Mode)
 // -----------------------------------------------------------------------------
@@ -14,7 +22,7 @@ import (
 type DataPacket struct {
 	InterestQsf float64   // Interest QoS factor
 	DataQsf     float64   // Data QoS factor
-	Values      []float64 // Vector of 150 double values
+	Values      []float64 // Vector of configurable length (DataPacketValueCount)
 }
 
 // NewDataPacket creates a new DataPacket with default values
@@ -22,15 +30,15 @@ func NewDataPacket() *DataPacket {
 	return &DataPacket{
 		InterestQsf: 0.0,
 		DataQsf:     0.0,
-		Values:      make([]float64, 150), // All initialized to 0.0
+		Values:      make([]float64, DataPacketValueCount), // All initialized to 0.0
 	}
 }
 
 // NewDataPacketWithValues creates a DataPacket with specified values
 func NewDataPacketWithValues(interestQsf, dataQsf float64, values []float64) *DataPacket {
-	if len(values) != 150 {
-		// Ensure exactly 150 values
-		adjustedValues := make([]float64, 150)
+	if len(values) != DataPacketValueCount {
+		// Ensure exactly DataPacketValueCount values.
+		adjustedValues := make([]float64, DataPacketValueCount)
 		copy(adjustedValues, values)
 		values = adjustedValues
 	}
@@ -58,7 +66,7 @@ func (dp *DataPacket) SerializeData() ([]byte, error) {
 		return nil, fmt.Errorf("failed to write DataQsf: %w", err)
 	}
 
-	// Write 150 double values (8 bytes each = 1200 bytes total)
+	// Write DataPacketValueCount double values.
 	for i, value := range dp.Values {
 		err = binary.Write(buf, binary.LittleEndian, value)
 		if err != nil {
@@ -71,14 +79,14 @@ func (dp *DataPacket) SerializeData() ([]byte, error) {
 
 // Deserialize converts byte array back to DataPacket
 func DeserializeData(data []byte) (*DataPacket, error) {
-	expectedSize := 8 + 8 + (150 * 8) // InterestQsf + DataQsf + 150 values
+	expectedSize := (dataPacketMetaFields * float64SizeBytes) + (DataPacketValueCount * float64SizeBytes)
 	if len(data) != expectedSize {
 		return nil, fmt.Errorf("invalid data size: expected %d bytes, got %d", expectedSize, len(data))
 	}
 
 	buf := bytes.NewReader(data)
 	dp := &DataPacket{
-		Values: make([]float64, 150),
+		Values: make([]float64, DataPacketValueCount),
 	}
 
 	// Read InterestQsf
@@ -93,8 +101,8 @@ func DeserializeData(data []byte) (*DataPacket, error) {
 		return nil, fmt.Errorf("failed to read DataQsf: %w", err)
 	}
 
-	// Read 150 double values
-	for i := 0; i < 150; i++ {
+	// Read DataPacketValueCount double values.
+	for i := 0; i < DataPacketValueCount; i++ {
 		err = binary.Read(buf, binary.LittleEndian, &dp.Values[i])
 		if err != nil {
 			return nil, fmt.Errorf("failed to read value at index %d: %w", i, err)
@@ -112,7 +120,7 @@ func (dp *DataPacket) String() string {
 
 // GetSize returns the total size in bytes when serialized
 func (dp *DataPacket) GetSize() int {
-	return 8 + 8 + (len(dp.Values) * 8) // 2 metadata + values
+	return (dataPacketMetaFields * float64SizeBytes) + (len(dp.Values) * float64SizeBytes)
 }
 
 // -----------------------------------------------------------------------------

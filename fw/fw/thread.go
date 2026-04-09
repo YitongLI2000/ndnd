@@ -405,18 +405,17 @@ func (t *Thread) processOutgoingInterest(
 	// Get outgoing face
 	outgoingFace := dispatch.GetFace(nexthop)
 	if outgoingFace == nil {
-		core.Log.Error(t, "Non-existent nexthop", "name", packet.Name, "faceid", nexthop)
+		core.Log.Error(t, "SendInterest failed", "reason", "face-missing", "name", packet.Name, "faceid", nexthop)
 		return false
 	}
 	if outgoingFace.FaceID() == inFace && outgoingFace.LinkType() != defn.AdHoc {
-		core.Log.Trace(t, "Prevent send Interest back to incoming face", "name", packet.Name, "faceid", nexthop)
-		return false
+		// Keep anti-loop protection, but do not report as SendInterest failure.
+		return true
 	}
 
 	// Drop if HopLimit (if present) on Interest going to non-local face is 0. If so, drop
 	if interest.HopLimitV != nil && int(*interest.HopLimitV) == 0 &&
 		outgoingFace.Scope() == defn.NonLocal {
-		core.Log.Trace(t, "Prevent send Interest with HopLimit=0 to non-local face", "name", packet.Name, "faceid", nexthop)
 		return false
 	}
 

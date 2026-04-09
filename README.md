@@ -55,7 +55,7 @@ git clone -b emulation-ndnd https://github.com/YitongLI2000/MARS-ndnsim.git mars
     ```
 - Build receiver/sender
     ```
-    cd std/examples/yitong-mars-three2many/apps/consumer
+    cd std/examples/mars
     go build consumer.go
     cd ../producer
     go build producer.go
