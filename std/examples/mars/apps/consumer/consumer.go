@@ -56,13 +56,11 @@ const (
 // DT_INIT_RATE = 3000.0
 // THROUGHPUT_WINDOW_DUR = 20 * time.Millisecond
 // RC_MIN_RATE = 10.0
-// MAX_BURST = 5.0
 const (
 	baseMaxPackets         = 15000
 	baseDTInitRate         = 3000.0
 	baseThroughputWindow   = 20 * time.Millisecond
 	baseRCMinRate          = 10.0
-	baseMaxBurst           = 5.0
 	baseDataPacketSizeByte = 16 + (150 * 8) // InterestQsf + DataQsf + 150 float64 values
 )
 
@@ -71,7 +69,6 @@ var (
 	DT_INIT_RATE          = baseDTInitRate
 	THROUGHPUT_WINDOW_DUR = baseThroughputWindow
 	RC_MIN_RATE           = baseRCMinRate
-	MAX_BURST             = baseMaxBurst
 )
 
 // --- Asynchronous Workload Settings ---
@@ -121,7 +118,6 @@ func applyAdaptiveDtTunables() {
 
 	DT_INIT_RATE = math.Max(1.0, baseDTInitRate*scale)
 	RC_MIN_RATE = math.Max(1.0, baseRCMinRate*scale)
-	MAX_BURST = math.Max(1.0, math.Round(baseMaxBurst*scale))
 	MAX_PACKETS = int(math.Max(1.0, math.Round(float64(baseMaxPackets)*scale)))
 	THROUGHPUT_WINDOW_DUR = time.Duration(float64(baseThroughputWindow) / scale)
 	if THROUGHPUT_WINDOW_DUR < TICKER_INTERVAL {
@@ -133,7 +129,6 @@ func applyAdaptiveDtTunables() {
 		"scale", scale,
 		"DT_INIT_RATE", DT_INIT_RATE,
 		"RC_MIN_RATE", RC_MIN_RATE,
-		"MAX_BURST", MAX_BURST,
 		"MAX_PACKETS", MAX_PACKETS,
 		"THROUGHPUT_WINDOW_DUR", THROUGHPUT_WINDOW_DUR)
 }
@@ -519,12 +514,14 @@ func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, 
 		}
 
 		var totalWinRTT float64
+		var totalWinBytes int
 		wCount := len(f.window)
 		if wCount == 0 {
 			return
 		}
 		for _, s := range f.window {
 			totalWinRTT += s.RTT
+			totalWinBytes += s.Size
 		}
 		avgWinRTT := totalWinRTT / float64(wCount)
 		measuredPPS := float64(wCount) / THROUGHPUT_WINDOW_DUR.Seconds()
@@ -567,6 +564,8 @@ func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, 
 		oldRate := f.currentRate
 		f.currentRate = targetRate
 		f.lastRateUpdate = receiveTime
+		avgPayloadBytes := float64(totalWinBytes) / float64(wCount)
+		estimatedBWMbps := (f.estimatedBandwidth * avgPayloadBytes * 8.0) / 1e6
 
 		log.Debug(consumerTag, "Rate Adjusted",
 			"prefix", f.Prefix,
@@ -574,6 +573,7 @@ func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, 
 			"newTargetRate", f.currentRate,
 			"actualRate", actualRate,
 			"estimatedBW", f.estimatedBandwidth,
+			"estimatedBWMbps", estimatedBWMbps,
 			"baseRTT", f.baseRTT,
 			"latestRTT", avgWinRTT)
 
@@ -938,9 +938,6 @@ func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.W
 
 			currentRate := flowCtx.GetRate()
 			tokens += currentRate * TICKER_INTERVAL.Seconds()
-			if tokens > MAX_BURST {
-				tokens = MAX_BURST
-			}
 
 			for tokens >= 1.0 {
 				if sequenceNum >= MAX_PACKETS {
