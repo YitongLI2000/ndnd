@@ -41,6 +41,64 @@ CONSUMER_START_DELAYS = {
 }
 
 # ==============================================================================
+#  CONFIG GENERATION PARAMETERS
+# ==============================================================================
+DV_NETWORK_NAME = "/hkustgz"
+DV_KEYCHAIN = "insecure"
+
+# One editable parameter block per node type.
+DV_TYPE_PARAMS = {
+    'con': {'advertise_interval': 1000, 'router_dead_interval': 300000},
+    'core': {'advertise_interval': 1000, 'router_dead_interval': 300000},
+    'edge': {'advertise_interval': 1000, 'router_dead_interval': 300000},
+    'pro': {'advertise_interval': 1000, 'router_dead_interval': 300000},
+}
+
+# One editable parameter block per node type.
+FW_TYPE_PARAMS = {
+    'con': {
+        'core_log_level': "INFO",
+        'udp_enabled_unicast': True,
+        'udp_enabled_multicast': False,
+        'udp_port_unicast': 6363,
+        'tcp_enabled': True,
+        'tcp_port_unicast': 6363,
+        'websocket_enabled': False,
+        'threads': 32,
+    },
+    'core': {
+        'core_log_level': "INFO",
+        'udp_enabled_unicast': True,
+        'udp_enabled_multicast': False,
+        'udp_port_unicast': 6363,
+        'tcp_enabled': True,
+        'tcp_port_unicast': 6363,
+        'websocket_enabled': False,
+        'threads': 32,
+    },
+    'edge': {
+        'core_log_level': "INFO",
+        'udp_enabled_unicast': True,
+        'udp_enabled_multicast': False,
+        'udp_port_unicast': 6363,
+        'tcp_enabled': True,
+        'tcp_port_unicast': 6363,
+        'websocket_enabled': False,
+        'threads': 32,
+    },
+    'pro': {
+        'core_log_level': "INFO",
+        'udp_enabled_unicast': True,
+        'udp_enabled_multicast': False,
+        'udp_port_unicast': 6363,
+        'tcp_enabled': True,
+        'tcp_port_unicast': 6363,
+        'websocket_enabled': False,
+        'threads': 32,
+    },
+}
+
+# ==============================================================================
 #  TOPOLOGY DEFINITION (Fixed Physical Layout)
 # ==============================================================================
 NODES = [
@@ -160,6 +218,93 @@ class LinuxRouter(Node):
         super(LinuxRouter, self).config(**params)
         self.cmd('sysctl -w net.ipv4.ip_forward=1')
 
+def get_node_type(node_name):
+    if node_name.startswith('con'):
+        return 'con'
+    if node_name.startswith('core'):
+        return 'core'
+    if node_name.startswith('edge'):
+        return 'edge'
+    if node_name.startswith('pro'):
+        return 'pro'
+    raise ValueError(f"Unknown node type for node '{node_name}'")
+
+def bool_yaml(value):
+    return "true" if value else "false"
+
+def build_neighbors_by_node(allocator):
+    neighbors = {node_name: [] for node_name in NODES}
+    for src_name, dst_name, *_ in LINKS:
+        src_neighbor_ip = allocator.get_link_ip(dst_name, src_name)
+        dst_neighbor_ip = allocator.get_link_ip(src_name, dst_name)
+
+        if src_neighbor_ip is None or dst_neighbor_ip is None:
+            raise RuntimeError(f"Missing IP allocation for link {src_name}<->{dst_name}")
+
+        neighbors[src_name].append((dst_name, src_neighbor_ip))
+        neighbors[dst_name].append((src_name, dst_neighbor_ip))
+    return neighbors
+
+def render_node_config(node_name, node_neighbors):
+    node_type = get_node_type(node_name)
+    dv_params = DV_TYPE_PARAMS[node_type]
+    fw_params = FW_TYPE_PARAMS[node_type]
+
+    lines = [
+        "dv:",
+        f"  network: {DV_NETWORK_NAME}",
+        f"  router: {DV_NETWORK_NAME}/{node_name}",
+        f"  keychain: \"{DV_KEYCHAIN}\"",
+        "  neighbors:",
+    ]
+
+    for neighbor_name, neighbor_ip in node_neighbors:
+        lines.append(f"    - uri: \"udp://{neighbor_ip}:6363\" # Neighbor: {neighbor_name}")
+
+    lines.extend([
+        f"  advertise_interval: {dv_params['advertise_interval']}",
+        f"  router_dead_interval: {dv_params['router_dead_interval']}",
+        "",
+        "fw:",
+        "  core:",
+    ])
+
+    lines.append(f"    log_level: {fw_params['core_log_level']}")
+
+    lines.extend([
+        "  faces:",
+        "    udp:",
+        f"      enabled_unicast: {bool_yaml(fw_params['udp_enabled_unicast'])}",
+        f"      enabled_multicast: {bool_yaml(fw_params['udp_enabled_multicast'])}",
+        f"      port_unicast: {fw_params['udp_port_unicast']}",
+        "      # default_mtu: 1420",
+        "    tcp:",
+        f"      enabled: {bool_yaml(fw_params['tcp_enabled'])}",
+        f"      port_unicast: {fw_params['tcp_port_unicast']}",
+        "    websocket:",
+        f"      enabled: {bool_yaml(fw_params['websocket_enabled'])}",
+        "  fw:",
+        f"    threads: {fw_params['threads']}",
+        f"    strategy_node_name: {node_name}",
+        "",
+    ])
+
+    return "\n".join(lines)
+
+def regenerate_all_node_configs(allocator):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    configs_dir = os.path.join(script_dir, '..', 'configs')
+    os.makedirs(configs_dir, exist_ok=True)
+
+    neighbors_by_node = build_neighbors_by_node(allocator)
+    for node_name in NODES:
+        cfg_path = os.path.join(configs_dir, f"{node_name}.yml")
+        cfg_content = render_node_config(node_name, neighbors_by_node[node_name])
+        with open(cfg_path, "w", encoding="ascii", newline="\n") as cfg_file:
+            cfg_file.write(cfg_content)
+
+    print(f"Regenerated {len(NODES)} node config files in {configs_dir}")
+
 # ==============================================================================
 #  SETUP & EXECUTION
 # ==============================================================================
@@ -228,12 +373,15 @@ def warmup_network(net, allocator):
     else:
         print(f"❌ Warmup finished with {failed_links} failures.")
 
-def start_ndnd_daemons(net):
+def start_ndnd_daemons(net, allocator):
     print(f"\nStarting ndnd daemons on {len(NODES)} nodes...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     configs_dir = os.path.join(script_dir, '..', 'configs')
     logs_dir = os.path.join(script_dir, '..', 'logs')
     os.makedirs(logs_dir, exist_ok=True)
+
+    # Always regenerate/override all configs from the current topology before daemon start.
+    regenerate_all_node_configs(allocator)
     
     for node_name in NODES:
         node = net.get(node_name)
@@ -306,6 +454,61 @@ def configure_dynamic_routing(net):
         pro_node.cmd('ndnd fw strategy-set prefix=/ strategy=/localhost/nfd/strategy/multipath/v=1')
         print(f"  -> {pro_name}: Strategy set to multipath.")
 
+def verify_dynamic_routing_shape_or_die(net):
+    if NUM_ACTIVE_CONSUMERS <= 0:
+        return
+
+    con_name = "con0"
+    con_node = net.get(con_name)
+    route_output = con_node.cmd('ndnd fw route-list')
+
+    prefix_costs = {}
+    for line in route_output.split('\n'):
+        if 'prefix=/pro' not in line:
+            continue
+        p_match = re.search(r'prefix=([^ ]+)', line)
+        c_match = re.search(r'cost=(\d+)', line)
+        if p_match and c_match:
+            prefix = p_match.group(1)
+            cost = int(c_match.group(1))
+            if prefix not in prefix_costs:
+                prefix_costs[prefix] = []
+            prefix_costs[prefix].append(cost)
+
+    if not prefix_costs:
+        print(f"❌ Dynamic routing verification failed on {con_name}: no /pro* routes found.")
+        sys.exit(1)
+
+    for prefix, costs in sorted(prefix_costs.items()):
+        min_cost = min(costs)
+        min_count = sum(1 for c in costs if c == min_cost)
+        higher_costs = [c for c in costs if c > min_cost]
+
+        if min_count != 1:
+            print(
+                f"❌ Dynamic routing verification failed on {con_name}: "
+                f"{prefix} has {min_count} least-cost nexthops (expected 1). "
+                f"Costs={costs}"
+            )
+            sys.exit(1)
+
+        if not higher_costs:
+            print(
+                f"❌ Dynamic routing verification failed on {con_name}: "
+                f"{prefix} has no higher-cost backup nexthops. Costs={costs}"
+            )
+            sys.exit(1)
+
+        unique_higher = sorted(set(higher_costs))
+        if len(unique_higher) != 1:
+            print(
+                f"❌ Dynamic routing verification failed on {con_name}: "
+                f"{prefix} higher costs are not equal. Costs={costs}"
+            )
+            sys.exit(1)
+
+    print(f"✅ Dynamic routing verification passed on {con_name} (all /pro* prefixes).")
+
 def run_applications(net):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     apps_dir = os.path.join(script_dir, '..', 'apps')
@@ -340,6 +543,7 @@ def run_applications(net):
     time.sleep(5)
 
     configure_dynamic_routing(net)
+    verify_dynamic_routing_shape_or_die(net)
 
     print(f"\n=== Starting {NUM_ACTIVE_CONSUMERS} Consumer Applications ===")
     c_bin = os.path.join(apps_dir, 'consumer', 'consumer')
@@ -384,7 +588,7 @@ if __name__ == '__main__':
     try:
         log_ip_configuration(net)
         warmup_network(net, allocator)
-        start_ndnd_daemons(net)
+        start_ndnd_daemons(net, allocator)
         run_applications(net)
         CLI(net)
     finally:
@@ -392,4 +596,3 @@ if __name__ == '__main__':
         net.stop()
         os.chdir(original_dir)
         os.system('mn -c > /dev/null 2>&1')
-

@@ -25,3 +25,9 @@ __pycache__/
 /temp/
 *.wasm
 .codex
+
+# Built example application binaries
+std/examples/**/apps/consumer/consumer
+std/examples/**/apps/consumer/consumer.exe
+std/examples/**/apps/producer/producer
+std/examples/**/apps/producer/producer.exe

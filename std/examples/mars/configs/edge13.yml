@@ -10,7 +10,7 @@ dv:
 
 fw:
   core:
-    log_level: DEBUG
+    log_level: INFO
   faces:
     udp:
       enabled_unicast: true
@@ -23,5 +23,5 @@ fw:
     websocket:
       enabled: false
   fw:
-    threads: 64
+    threads: 32
     strategy_node_name: edge13

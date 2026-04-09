@@ -2,14 +2,14 @@ dv:
   network: /hkustgz
   router: /hkustgz/pro0
   keychain: "insecure"
-  neighbors: 
+  neighbors:
     - uri: "udp://172.16.0.2:6363" # Neighbor: edge0
   advertise_interval: 1000
   router_dead_interval: 300000
 
 fw:
   core:
-    log_level: DEBUG   
+    log_level: INFO
   faces:
     udp:
       enabled_unicast: true
