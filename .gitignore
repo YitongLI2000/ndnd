@@ -31,3 +31,5 @@ std/examples/**/apps/consumer/consumer
 std/examples/**/apps/consumer/consumer.exe
 std/examples/**/apps/producer/producer
 std/examples/**/apps/producer/producer.exe
+std/examples/mars/configs/*
+std/examples/mars/reference/*

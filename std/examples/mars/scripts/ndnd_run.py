@@ -40,6 +40,14 @@ CONSUMER_START_DELAYS = {
     'con2': 2,  # Starts 2 seconds later
 }
 
+# 5. Post-Run Behavior
+#    - "cli": keep Mininet interactive shell after apps start (default behavior).
+#    - "auto_exit_on_flow_summary": exit Mininet automatically after all expected
+#      consumer "Flow Summary" lines are observed.
+POST_RUN_MODE = "auto_exit_on_flow_summary"
+FLOW_SUMMARY_POLL_INTERVAL_SEC = 2
+FLOW_SUMMARY_TIMEOUT_SEC = 1200
+
 # ==============================================================================
 #  CONFIG GENERATION PARAMETERS
 # ==============================================================================
@@ -57,7 +65,7 @@ DV_TYPE_PARAMS = {
 # One editable parameter block per node type.
 FW_TYPE_PARAMS = {
     'con': {
-        'core_log_level': "INFO",
+        'core_log_level': "DEBUG",
         'udp_enabled_unicast': True,
         'udp_enabled_multicast': False,
         'udp_port_unicast': 6363,
@@ -116,48 +124,48 @@ NODES = [
 
 LINKS = [
     # Producers to Edges (Lossless)
-    ('pro0', 'edge0', 40, '1ms', 500, 0), ('pro1', 'edge1', 40, '1ms', 500, 0),
-    ('pro2', 'edge2', 40, '1ms', 500, 0), ('pro3', 'edge3', 40, '1ms', 500, 0),
-    ('pro4', 'edge4', 40, '1ms', 500, 0), ('pro5', 'edge5', 40, '1ms', 500, 0),
-    ('pro6', 'edge6', 40, '1ms', 500, 0), ('pro7', 'edge7', 40, '1ms', 500, 0),
-    ('pro8', 'edge8', 40, '1ms', 500, 0), ('pro9', 'edge9', 40, '1ms', 500, 0),
-    ('pro10', 'edge10', 40, '1ms', 500, 0), ('pro11', 'edge11', 40, '1ms', 500, 0),
-    ('pro12', 'edge12', 40, '1ms', 500, 0), ('pro13', 'edge13', 40, '1ms', 500, 0),
-    ('pro14', 'edge14', 40, '1ms', 500, 0), 
+    ('pro0', 'edge0', 40, '1ms', 1000, 0), ('pro1', 'edge1', 40, '1ms', 1000, 0),
+    ('pro2', 'edge2', 40, '1ms', 1000, 0), ('pro3', 'edge3', 40, '1ms', 1000, 0),
+    ('pro4', 'edge4', 40, '1ms', 1000, 0), ('pro5', 'edge5', 40, '1ms', 1000, 0),
+    ('pro6', 'edge6', 40, '1ms', 1000, 0), ('pro7', 'edge7', 40, '1ms', 1000, 0),
+    ('pro8', 'edge8', 40, '1ms', 1000, 0), ('pro9', 'edge9', 40, '1ms', 1000, 0),
+    ('pro10', 'edge10', 40, '1ms', 1000, 0), ('pro11', 'edge11', 40, '1ms', 1000, 0),
+    ('pro12', 'edge12', 40, '1ms', 1000, 0), ('pro13', 'edge13', 40, '1ms', 1000, 0),
+    ('pro14', 'edge14', 40, '1ms', 1000, 0), 
     
     # Edges to Core0 (Edges 0-4)
-    ('edge0', 'core0', 40, '1ms', 500, 0), ('edge1', 'core0', 40, '1ms', 500, 0),
-    ('edge2', 'core0', 40, '1ms', 500, 0), ('edge3', 'core0', 40, '1ms', 500, 0),
-    ('edge4', 'core0', 40, '1ms', 500, 0),
+    ('edge0', 'core0', 40, '1ms', 1000, 0), ('edge1', 'core0', 40, '1ms', 1000, 0),
+    ('edge2', 'core0', 40, '1ms', 1000, 0), ('edge3', 'core0', 40, '1ms', 1000, 0),
+    ('edge4', 'core0', 40, '1ms', 1000, 0),
     # Edges to Core1 (Edges 5-9)
-    ('edge5', 'core1', 40, '1ms', 500, 0), ('edge6', 'core1', 40, '1ms', 500, 0),
-    ('edge7', 'core1', 40, '1ms', 500, 0), ('edge8', 'core1', 40, '1ms', 500, 0),
-    ('edge9', 'core1', 40, '1ms', 500, 0),
+    ('edge5', 'core1', 40, '1ms', 1000, 0), ('edge6', 'core1', 40, '1ms', 1000, 0),
+    ('edge7', 'core1', 40, '1ms', 1000, 0), ('edge8', 'core1', 40, '1ms', 1000, 0),
+    ('edge9', 'core1', 40, '1ms', 1000, 0),
     # Edges to Core2 (Edges 10-14)
-    ('edge10', 'core2', 40, '1ms', 500, 0), ('edge11', 'core2', 40, '1ms', 500, 0),
-    ('edge12', 'core2', 40, '1ms', 500, 0), ('edge13', 'core2', 40, '1ms', 500, 0),
-    ('edge14', 'core2', 40, '1ms', 500, 0),
+    ('edge10', 'core2', 40, '1ms', 1000, 0), ('edge11', 'core2', 40, '1ms', 1000, 0),
+    ('edge12', 'core2', 40, '1ms', 1000, 0), ('edge13', 'core2', 40, '1ms', 1000, 0),
+    ('edge14', 'core2', 40, '1ms', 1000, 0),
 
     # Consumer to Cores (With Configurable Loss)
     # con0 -> Mesh
-    ('con0', 'core0', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con0', 'core1', 40, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con0', 'core2', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con0', 'core3', 40, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con0', 'core4', 40, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con0', 'core0', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con0', 'core1', 40, '1ms', 1000, CON_TO_CORE_LOSS),
+    ('con0', 'core2', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con0', 'core3', 40, '1ms', 1000, CON_TO_CORE_LOSS),
+    ('con0', 'core4', 40, '1ms', 1000, CON_TO_CORE_LOSS),
     # con1 -> Mesh
-    ('con1', 'core0', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con1', 'core1', 40, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con1', 'core2', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con1', 'core3', 40, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con1', 'core4', 40, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con1', 'core0', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con1', 'core1', 40, '1ms', 1000, CON_TO_CORE_LOSS),
+    ('con1', 'core2', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con1', 'core3', 40, '1ms', 1000, CON_TO_CORE_LOSS),
+    ('con1', 'core4', 40, '1ms', 1000, CON_TO_CORE_LOSS),
     # con2 -> Mesh
-    ('con2', 'core0', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con2', 'core1', 40, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con2', 'core2', 40, '1ms', 500, CON_TO_CORE_LOSS), ('con2', 'core3', 40, '1ms', 500, CON_TO_CORE_LOSS),
-    ('con2', 'core4', 40, '1ms', 500, CON_TO_CORE_LOSS),
+    ('con2', 'core0', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con2', 'core1', 40, '1ms', 1000, CON_TO_CORE_LOSS),
+    ('con2', 'core2', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con2', 'core3', 40, '1ms', 1000, CON_TO_CORE_LOSS),
+    ('con2', 'core4', 40, '1ms', 1000, CON_TO_CORE_LOSS),
 
     # Core Mesh (Lossless)
-    ('core0', 'core1', 40, '1ms', 500, 0), ('core0', 'core2', 40, '1ms', 500, 0),
-    ('core0', 'core3', 40, '1ms', 500, 0), ('core0', 'core4', 40, '1ms', 500, 0),
-    ('core1', 'core2', 40, '1ms', 500, 0), ('core1', 'core3', 40, '1ms', 500, 0),
-    ('core1', 'core4', 40, '1ms', 500, 0), ('core2', 'core3', 40, '1ms', 500, 0),
-    ('core2', 'core4', 40, '1ms', 500, 0), ('core3', 'core4', 40, '1ms', 500, 0)
+    ('core0', 'core1', 40, '1ms', 1000, 0), ('core0', 'core2', 40, '1ms', 1000, 0),
+    ('core0', 'core3', 40, '1ms', 1000, 0), ('core0', 'core4', 40, '1ms', 1000, 0),
+    ('core1', 'core2', 40, '1ms', 1000, 0), ('core1', 'core3', 40, '1ms', 1000, 0),
+    ('core1', 'core4', 40, '1ms', 1000, 0), ('core2', 'core3', 40, '1ms', 1000, 0),
+    ('core2', 'core4', 40, '1ms', 1000, 0), ('core3', 'core4', 40, '1ms', 1000, 0)
 ]
 
 # ==============================================================================
@@ -575,6 +583,58 @@ def run_applications(net):
     
     print("All applications running.")
 
+def _count_flow_summary_lines(log_path):
+    if not os.path.exists(log_path):
+        return 0
+
+    count = 0
+    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if "Flow Summary" in line:
+                count += 1
+    return count
+
+def wait_for_all_flow_summaries(logs_dir):
+    active_consumers = [f'con{i}' for i in range(NUM_ACTIVE_CONSUMERS)]
+    expected_per_consumer = NUM_PRODUCERS_PER_CONSUMER
+    expected_total = expected_per_consumer * len(active_consumers)
+
+    print(
+        f"\nWaiting for Flow Summary completion "
+        f"(expected total={expected_total}, per-consumer={expected_per_consumer})..."
+    )
+
+    start = time.time()
+    last_reported_total = -1
+    while time.time() - start <= FLOW_SUMMARY_TIMEOUT_SEC:
+        per_consumer_counts = {}
+        total_count = 0
+        done = True
+
+        for con_name in active_consumers:
+            log_path = os.path.join(logs_dir, f"{con_name}_app.log")
+            flow_summary_count = _count_flow_summary_lines(log_path)
+            per_consumer_counts[con_name] = flow_summary_count
+            total_count += flow_summary_count
+            if flow_summary_count < expected_per_consumer:
+                done = False
+
+        if done:
+            print(f"✅ Flow Summary completion detected: {per_consumer_counts}")
+            return True
+
+        if total_count != last_reported_total:
+            print(f"⏳ Flow Summary progress: {per_consumer_counts} (total={total_count}/{expected_total})")
+            last_reported_total = total_count
+
+        time.sleep(FLOW_SUMMARY_POLL_INTERVAL_SEC)
+
+    print(
+        f"❌ Timeout waiting for Flow Summary completion after {FLOW_SUMMARY_TIMEOUT_SEC}s. "
+        f"Mode={POST_RUN_MODE}"
+    )
+    return False
+
 if __name__ == '__main__':
     check_scaling_limits()
     setLogLevel('info')
@@ -590,7 +650,17 @@ if __name__ == '__main__':
         warmup_network(net, allocator)
         start_ndnd_daemons(net, allocator)
         run_applications(net)
-        CLI(net)
+        if POST_RUN_MODE == "auto_exit_on_flow_summary":
+            logs_dir = os.path.join(script_dir, '..', 'logs')
+            completed = wait_for_all_flow_summaries(logs_dir)
+            if not completed:
+                print("Falling back to interactive CLI due to incomplete Flow Summary.")
+                CLI(net)
+        elif POST_RUN_MODE == "cli":
+            CLI(net)
+        else:
+            print(f"Unknown POST_RUN_MODE '{POST_RUN_MODE}', falling back to CLI.")
+            CLI(net)
     finally:
         stop_ndnd_daemons(net)
         net.stop()

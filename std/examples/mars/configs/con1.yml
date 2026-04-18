@@ -13,7 +13,7 @@ dv:
 
 fw:
   core:
-    log_level: INFO
+    log_level: DEBUG
   faces:
     udp:
       enabled_unicast: true

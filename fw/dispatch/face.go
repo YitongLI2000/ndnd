@@ -27,6 +27,9 @@ type Face interface {
 
 	State() defn.State
 
+	// GetSendQueueSize returns the transport send-queue occupancy metric.
+	GetSendQueueSize() uint64
+
 	SendPacket(out OutPkt)
 }
 

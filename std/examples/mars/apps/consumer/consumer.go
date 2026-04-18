@@ -28,9 +28,11 @@ const (
 	TICKER_INTERVAL   = 1 * time.Millisecond
 
 	// RTT & Retransmission Defaults (DT Only)
-	RTT_WINDOW_DURATION = 1 * time.Second
-	MIN_RTO             = 60.0
-	MAX_RTO             = 600.0
+	RTT_WINDOW_DURATION = 600 * time.Millisecond
+	MIN_RTO             = 80.0
+	MAX_RTO             = 800.0
+	// DT control-update period = DT_CONTROL_PERIOD_RTT_SCALE * avg bootstrap RTT.
+	DT_CONTROL_PERIOD_RTT_SCALE = 1.0
 )
 
 // --- Path Discovery (PD) Configuration ---
@@ -119,10 +121,8 @@ func applyAdaptiveDtTunables() {
 	DT_INIT_RATE = math.Max(1.0, baseDTInitRate*scale)
 	RC_MIN_RATE = math.Max(1.0, baseRCMinRate*scale)
 	MAX_PACKETS = int(math.Max(1.0, math.Round(float64(baseMaxPackets)*scale)))
-	THROUGHPUT_WINDOW_DUR = time.Duration(float64(baseThroughputWindow) / scale)
-	if THROUGHPUT_WINDOW_DUR < TICKER_INTERVAL {
-		THROUGHPUT_WINDOW_DUR = TICKER_INTERVAL
-	}
+	// Keep DT sliding-window duration static (no chunk-size shaping).
+	THROUGHPUT_WINDOW_DUR = baseThroughputWindow
 
 	log.Info(consumerTag, "Adaptive DT tuning applied",
 		"dataPacketSizeBytes", currentPktSize,
@@ -146,6 +146,11 @@ type RTTSample struct {
 	RTT       float64
 }
 
+type PendingSend struct {
+	SendTime      time.Time
+	Retransmitted bool
+}
+
 type FlowContext struct {
 	mu       sync.Mutex
 	Prefix   string
@@ -155,7 +160,7 @@ type FlowContext struct {
 	// --- Shared State ---
 	currentRate  float64
 	rto          float64
-	pendingSends map[string]time.Time
+	pendingSends map[string]PendingSend
 
 	totalBytes        int64
 	pktsReceivedTotal int
@@ -198,7 +203,7 @@ func NewFlowContext(prefix string) *FlowContext {
 		startTime:    now,
 		endTime:      now,
 		doneCh:       make(chan struct{}),
-		pendingSends: make(map[string]time.Time),
+		pendingSends: make(map[string]PendingSend),
 		resetSignal:  make(chan struct{}, 1),
 	}
 
@@ -264,9 +269,26 @@ func (f *FlowContext) GetRTO() float64 {
 	return f.rto
 }
 
-func (f *FlowContext) RecordInterestSend(name string, t time.Time) {
+func (f *FlowContext) RecordInterestSend(name string, t time.Time, isRetransmission bool) {
 	f.mu.Lock()
-	f.pendingSends[name] = t
+	entry, exists := f.pendingSends[name]
+	if !exists {
+		// First transmission for this name.
+		f.pendingSends[name] = PendingSend{
+			SendTime:      t,
+			Retransmitted: isRetransmission,
+		}
+	} else if isRetransmission {
+		// Karn's algorithm: keep original send timestamp and mark retransmitted.
+		entry.Retransmitted = true
+		f.pendingSends[name] = entry
+	} else {
+		// Fresh transmission path (non-retransmission).
+		f.pendingSends[name] = PendingSend{
+			SendTime:      t,
+			Retransmitted: false,
+		}
+	}
 
 	if f.Mode == ModeDT {
 		f.interestsSentInPeriod++
@@ -332,7 +354,7 @@ func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.T
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	sendTime, ok := f.pendingSends[dataName]
+	pending, ok := f.pendingSends[dataName]
 	if !ok {
 		return
 	}
@@ -393,7 +415,7 @@ func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.T
 			return
 		}
 
-		rttVal := float64(receiveTime.Sub(sendTime).Nanoseconds()) / 1e6
+		rttVal := float64(receiveTime.Sub(pending.SendTime).Nanoseconds()) / 1e6
 
 		f.endTime = receiveTime
 		f.totalBytes += int64(len(payload))
@@ -409,7 +431,11 @@ func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.T
 			log.Debug(consumerTag, "DT Data Received", "name", dataName, "rtt", rttVal, "totalRx", f.pktsReceivedTotal)
 		}
 
-		f.updateRTT(receiveTime, rttVal)
+		// Karn's algorithm: do not update RTT/RTO estimator with ambiguous RTT samples
+		// from Interests that were retransmitted.
+		if !pending.Retransmitted {
+			f.updateRTT(receiveTime, rttVal)
+		}
 		f.updateRateControl(receiveTime, len(payload), rttVal)
 	}
 }
@@ -450,7 +476,7 @@ func (f *FlowContext) updateRTT(receiveTime time.Time, rttVal float64) {
 		meanRTT = rttVal
 		variance = 0.0
 		calculatedRTO = math.Max(MIN_RTO, 2*rttVal)
-		finalRTO = 3 * calculatedRTO
+		finalRTO = 2 * calculatedRTO
 	} else {
 		var sum float64
 		for _, s := range f.rttHistory {
@@ -465,7 +491,7 @@ func (f *FlowContext) updateRTT(receiveTime time.Time, rttVal float64) {
 		variance = varSum / float64(count)
 		stdDev := math.Sqrt(variance)
 		calculatedRTO = meanRTT + 4*stdDev
-		finalRTO = 3 * calculatedRTO
+		finalRTO = 2 * calculatedRTO
 	}
 	if finalRTO < MIN_RTO {
 		finalRTO = MIN_RTO
@@ -473,6 +499,7 @@ func (f *FlowContext) updateRTT(receiveTime time.Time, rttVal float64) {
 	if finalRTO > MAX_RTO {
 		finalRTO = MAX_RTO
 	}
+
 	f.srtt = meanRTT
 	f.rttVar = variance
 	f.rto = finalRTO
@@ -495,13 +522,18 @@ func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, 
 		f.pktsCalibrated++
 		if f.pktsCalibrated == 5 {
 			f.baseRTT = f.initialRTTSum / 5.0
-			f.adjustmentPeriod = time.Duration(f.initialRTTSum) * time.Millisecond
+			// Use scaled average bootstrap RTT as control-update period (in ms).
+			f.adjustmentPeriod = time.Duration(f.baseRTT * DT_CONTROL_PERIOD_RTT_SCALE * float64(time.Millisecond))
 			if f.adjustmentPeriod < 20*time.Millisecond {
 				f.adjustmentPeriod = 20 * time.Millisecond
 			}
 			f.lastRateUpdate = receiveTime
 			f.interestsSentInPeriod = 0
-			log.Info(consumerTag, "Flow Calibration Complete", "flow", f.Prefix, "baseRTT", f.baseRTT)
+			log.Info(consumerTag, "Flow Calibration Complete",
+				"flow", f.Prefix,
+				"baseRTT", f.baseRTT,
+				"controlPeriodScale", DT_CONTROL_PERIOD_RTT_SCALE,
+				"adjustmentPeriod", f.adjustmentPeriod)
 		}
 		return
 	}
@@ -839,7 +871,7 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 	}
 
 	// Update pending sends map (needed for RTT calc in DT)
-	flowCtx.RecordInterestSend(interestName, sendTime)
+	flowCtx.RecordInterestSend(interestName, sendTime, isRetransmission)
 
 	// Add to Controller (if it's a retx, the controller already popped it, so we add it back/update it via Add)
 	// Note: In StartScheduler for DT, we pushed it back to heap. But here we might be adding a duplicate if we aren't careful.
@@ -880,9 +912,16 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 				data := args.Data
 				content := data.Content().Join()
 				dataName := data.Name().String()
-				globalRetxController.Remove(dataName)
+				// Always clear the exact outstanding key used by the retransmission controller.
+				// This avoids stale entries if returned Data name differs from expressed Interest name.
+				globalRetxController.Remove(interestName)
+				if dataName != interestName {
+					log.Debug(consumerTag, "Data name differs from Interest name",
+						"interestName", interestName, "dataName", dataName)
+					globalRetxController.Remove(dataName)
+				}
 				stats.IncrementData()
-				flowCtx.OnData(content, dataName, receiveTime)
+				flowCtx.OnData(content, interestName, receiveTime)
 			}
 		})
 }

@@ -26,6 +26,7 @@ import (
 // MaxFwThreads Maximum number of forwarding threads
 // const MaxFwThreads = 32
 const MaxFwThreads = 64
+const strategyTickInterval = 2 * time.Millisecond
 
 // Threads contains all forwarding threads
 var Threads []*Thread
@@ -85,6 +86,11 @@ type Thread struct {
 	nCsMisses             atomic.Uint64
 }
 
+// periodicStrategy is an optional strategy hook for periodic timer-driven logic.
+type periodicStrategy interface {
+	OnTick(now time.Time)
+}
+
 // NewThread creates a new forwarding thread
 func NewThread(id int) *Thread {
 	t := new(Thread)
@@ -138,6 +144,8 @@ func (t *Thread) Run() {
 	if CfgLockThreadsToCores() {
 		runtime.LockOSThread()
 	}
+	strategyTicker := time.NewTicker(strategyTickInterval)
+	defer strategyTicker.Stop()
 
 	for !core.ShouldQuit {
 		select {
@@ -155,6 +163,12 @@ func (t *Thread) Run() {
 			t.deadNonceList.RemoveExpiredEntries()
 		case <-t.pitCS.UpdateTicker():
 			t.pitCS.Update()
+		case now := <-strategyTicker.C:
+			for _, strategy := range t.strategies {
+				if ticked, ok := strategy.(periodicStrategy); ok {
+					ticked.OnTick(now)
+				}
+			}
 		case <-t.shouldQuit:
 			continue
 		}

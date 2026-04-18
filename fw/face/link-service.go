@@ -37,6 +37,7 @@ type LinkService interface {
 
 	ExpirationPeriod() time.Duration
 	State() defn.State
+	GetSendQueueSize() uint64
 
 	// Run is the main entry point for running face thread
 	// initial is optional new incoming frame
@@ -165,6 +166,14 @@ func (l *linkServiceBase) State() defn.State {
 		return defn.Up
 	}
 	return defn.Down
+}
+
+// GetSendQueueSize returns the current transport send-queue size metric.
+func (l *linkServiceBase) GetSendQueueSize() uint64 {
+	if l.transport == nil {
+		return 0
+	}
+	return l.transport.GetSendQueueSize()
 }
 
 //
