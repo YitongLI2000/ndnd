@@ -9,7 +9,7 @@ dv:
 
 fw:
   core:
-    log_level: INFO
+    log_level: DEBUG
   faces:
     udp:
       enabled_unicast: true
@@ -22,5 +22,5 @@ fw:
     websocket:
       enabled: false
   fw:
-    threads: 32
+    threads: 4
     strategy_node_name: pro9

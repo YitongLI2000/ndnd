@@ -1,7 +1,6 @@
 package fw
 
 import (
-	"bytes"
 	"math"
 	"sort"
 	"strconv"
@@ -21,9 +20,13 @@ import (
 
 // InterestQueueItem represents an item in the per-prefix Interest queue.
 type InterestQueueItem struct {
-	Packet   *defn.Pkt
-	PitEntry table.PitEntry
-	InFace   uint64
+	Packet         *defn.Pkt
+	PitEntry       table.PitEntry
+	InFace         uint64
+	OwnerThreadID  int
+	CandidateFaces []uint64
+	AssignedFace   uint64
+	EnqueueTime    time.Time
 }
 
 // hopSnapshot is an immutable copy of FIB nexthop metadata used by PD state.
@@ -34,7 +37,7 @@ type hopSnapshot struct {
 
 // DtRateControlParams keeps all DT face-level rate control hyperparameters in one place.
 // Units:
-// - Queue parameters are in "queue signal" units (to be defined by Step 1 integration).
+// - Queue parameters are normalized occupancy ratios in [0, 1].
 // - Rates are in Interests/sec.
 type DtRateControlParams struct {
 	MaxFwdQueueSize   float64
@@ -52,20 +55,50 @@ type DtRateControlParams struct {
 }
 
 const (
-	dtBaseThroughputWindow  = 20 * time.Millisecond
-	dtMinThroughputWindow   = 1 * time.Millisecond
-	dtMaxExpectedPps        = 100000.0
-	dtWindowSafetyFactor    = 2.0
-	dtSlopeTauRatio         = 1.0 / 3.0
-	dtControlRttInitSamples = 10
+	dtBaseThroughputWindow = 30 * time.Millisecond
+	dtMinThroughputWindow  = 1 * time.Millisecond
+	dtMaxExpectedPps       = 100000.0
+	dtWindowSafetyFactor   = 2.0
+	dtSlopeTauRatio        = 1.0 / 3.0
+	// Set to false to use RTT bootstrap: clamp(dtControlPeriodRttScale * avg(first 10 RTT samples)).
+	dtUseStaticControlPeriod = false
+	dtStaticControlPeriod    = 20 * time.Millisecond
+	dtControlRttInitSamples  = 10
 	// DT per-face control period = dtControlPeriodRttScale * avg bootstrap RTT.
 	dtControlPeriodRttScale = 1.0
-	dtControlPeriodMin      = 2 * time.Millisecond
-	dtControlPeriodMax      = 500 * time.Millisecond
+	dtControlPeriodMin      = 10 * time.Millisecond
+	dtControlPeriodMax      = 30 * time.Millisecond
+	dtControllerTick        = 2 * time.Millisecond //! Token controller allocation ticker
+	dtControllerDebugRounds = 200
+	// During partial bootstrap, occasionally probe unready faces while shaping ready faces.
+	dtPartialBootstrapProbeEvery = 8
+	// Emit scheduler execution debug summary every N per-face ticks per thread.
+	dtSchedulerDebugEveryTicks = 200
+	dtSchedulerMaxFacesPerTick = 16
+	dtSchedulerMaxSendPerTick  = 64
+	dtThreadBudgetCapPackets   = 512
+	// Liveness guard: when a face has pending demand but measured send is 0 in one
+	// control round, grant a tiny forced-send budget on upcoming ticks.
+	dtLivenessForcedPacketsPerStarvedRound = 2
+	dtLivenessForcedPacketsMax             = 32
+	dtLivenessStarvationLogThreshold       = 3
+	dtFaceTokenBurstCapPackets             = 64.0
+	dtBandwidthNoSampleWarnInterval        = 500 * time.Millisecond
+	dtBandwidthDecayPrevWeight             = 0.9
+	dtBandwidthDecayMeasuredWeight         = 0.1
+	dtBandwidthDirectAdoptMinSamples       = 8
+	// Per-thread logical DT Interest queue capacity used to normalize InterestQsf.
+	dtInterestQueueCapacityPackets = 20.0
+	// Mininet/netem qdisc packet limit used to normalize qdisc-derived DataQsf.
+	dtQdiscQueueCapacityPackets = 1000.0
+	// Link-service queue capacity used when DT metadata sources the ndnd send queue.
+	dtLinkServiceQueueCapacityPackets = 20.0
+	// DataQsf source for outgoing DT metadata: "qdisc", "transport", or "link-service".
+	dtDataQsfSource = "qdisc"
 )
 
 var dtRateControlParams = DtRateControlParams{
-	MaxFwdQueueSize:   20.0,
+	MaxFwdQueueSize:   1.0,
 	FwdQueueAlpha:     0.5,
 	FwdQueueBeta:      0.8,
 	FwdMDFactor:       0.9,
@@ -100,6 +133,25 @@ const (
 	DtActionGlobalMaxCapped
 )
 
+func dtLogFloat1(v float64) float64 {
+	return math.Round(v*10) / 10
+}
+
+func dtSendLimitReason(ratePps float64, measuredPps float64, pending int) string {
+	gap := ratePps - measuredPps
+	tolerance := math.Max(1.0, ratePps*0.1)
+	if gap <= -tolerance {
+		return "send-burst"
+	}
+	if math.Abs(gap) <= tolerance {
+		return "rate-matched"
+	}
+	if pending <= 0 {
+		return "iq-empty"
+	}
+	return "scheduler-limited"
+}
+
 func dtRateActionString(action DtRateControlAction) string {
 	switch action {
 	case DtActionEmergencyDecrease:
@@ -125,6 +177,32 @@ func dtRateActionString(action DtRateControlAction) string {
 	}
 }
 
+func conditionDtDataQsf(source string, raw float64) float64 {
+	_ = source
+	if raw < 0 || math.IsNaN(raw) {
+		return 0
+	}
+	if raw > 1 {
+		return 1
+	}
+	return raw
+}
+
+func normalizeDtQueueSignal(raw float64, capacity float64) float64 {
+	if raw <= 0 || capacity <= 0 || math.IsNaN(raw) || math.IsNaN(capacity) {
+		return 0
+	}
+	return conditionDtDataQsf("", raw/capacity)
+}
+
+func dtGlobalInterestQueueCapacityPackets() float64 {
+	nThreads := CfgNumThreads()
+	if nThreads < 1 {
+		nThreads = 1
+	}
+	return dtInterestQueueCapacityPackets * float64(nThreads)
+}
+
 type DtUpstreamSample struct {
 	Timestamp   time.Time
 	SizeBytes   int
@@ -145,7 +223,6 @@ type dtPrefixInterestSignal struct {
 	InterestSlope float64
 	DataQ         float64
 	DataSlope     float64
-	BWPps         float64
 	SampleCount   int
 	LastUpdated   time.Time
 }
@@ -156,12 +233,63 @@ type dtFaceInterestSignalState struct {
 }
 
 type dtFaceControlState struct {
-	mu        sync.Mutex
-	activated bool
-	period    time.Duration
-	nextRun   time.Time
-	rate      float64
-	action    DtRateControlAction
+	mu         sync.Mutex
+	activated  bool
+	period     time.Duration
+	nextRun    time.Time
+	rate       float64
+	action     DtRateControlAction
+	tokens     float64
+	lastRefill time.Time
+	// Aggregate sent packet counter for per-face actual send-rate estimation.
+	sentCounter         uint64
+	lastRateSampleCount uint64
+	lastRateSampleTime  time.Time
+	// Consecutive control rounds with pending demand but zero measured send rate.
+	starvationZeroSendRounds uint64
+	// Forced packets to inject in upcoming scheduler ticks for liveness.
+	livenessForcedPackets int
+	demandByThread        []int
+	budgetByThread        []int
+	budgetRR              int
+	budgetRounds          uint64
+}
+
+type dtFaceBandwidthState struct {
+	mu               sync.Mutex
+	samples          []time.Time
+	estimatedPps     float64
+	lastUpdated      time.Time
+	lastNoSampleWarn time.Time
+	lastUpdateRule   string
+	lastMeasuredPps  float64
+}
+
+type dtGlobalPrefixQueueState struct {
+	length atomic.Int64
+}
+
+type dtThreadFaceExecState struct {
+	prefixRR      uint64
+	tickCount     uint64
+	sentBootstrap uint64
+	sentShaped    uint64
+	emptyDequeues uint64
+	tokenMisses   uint64
+	sendAgeTotal  time.Duration
+	sendAgeMax    time.Duration
+	staleSends    uint64
+}
+
+type dtLocalPrefixQueue struct {
+	prefix string
+	queue  []*InterestQueueItem
+}
+
+type dtPrefixFaceAssignState struct {
+	credits     map[uint64]float64
+	assignCount map[uint64]uint64
+	logCount    uint64
 }
 
 // PathDiscoveryInfo holds all state for a specific prefix (Namespace).
@@ -198,8 +326,6 @@ type PathDiscoveryInfo struct {
 	// ---- Queue Management ----
 	// Keep PD and DT queues isolated even though they are both per-prefix.
 	PdInterestQueue []*InterestQueueItem
-	TxInterestQueue []*InterestQueueItem
-
 	// ---- Scheduler ----
 	Ticker     *time.Ticker
 	StopTicker chan struct{}
@@ -207,17 +333,16 @@ type PathDiscoveryInfo struct {
 	// ---- Data Transmission ----
 	ActiveFaces     []uint64
 	ActiveFaceIndex int
+	// Bootstrap RR index for immediate DT forwarding before per-face shaping is fully ready.
+	DtBootstrapFaceRR       int
+	DtBootstrapProbeCounter int
 	// Placeholder states for per-upstream DT congestion control.
 	// Update logic of these metrics is handled by separate steps.
-	UpstreamEstimatedBW      map[uint64]float64
 	UpstreamQsfInterest      map[uint64]float64
 	UpstreamQsfData          map[uint64]float64
 	UpstreamQsfInterestSlope map[uint64]float64
 	UpstreamQsfDataSlope     map[uint64]float64
 	UpstreamSamples          map[uint64][]DtUpstreamSample
-
-	// ---- Round-Robin Counter (for simple forwarding) (ATOMIC) ----
-	RoundRobinCounter uint64
 }
 
 // Shared state across all Multipath strategy instances (all threads)
@@ -226,10 +351,21 @@ var multipathPdState sync.Map
 var dtRttBootstrapByFace sync.Map
 var dtFaceInterestSignalByFace sync.Map
 var dtFaceControlByFace sync.Map
+var dtFaceBandwidthByFace sync.Map
+var dtGlobalPrefixQueueByPrefix sync.Map
+var dtControllerOnce sync.Once
 
 // Multipath Strategy Struct
 type Multipath struct {
 	StrategyBase
+	dtExecByFace        map[uint64]*dtThreadFaceExecState
+	dtQueuesByPrefix    map[string]*dtLocalPrefixQueue
+	dtAssignByPrefix    map[string]*dtPrefixFaceAssignState
+	dtLocalFacePrefixes map[uint64][]string
+	dtLocalFaceKnown    map[uint64]map[string]bool
+	dtLocalFaceOrder    []uint64
+	dtLocalFaceSeen     map[uint64]bool
+	dtLocalFaceRR       uint64
 }
 
 func init() {
@@ -240,6 +376,15 @@ func init() {
 
 func (s *Multipath) Instantiate(fwThread *Thread) {
 	s.NewStrategyBase(fwThread, "multipath", 1)
+	s.dtExecByFace = make(map[uint64]*dtThreadFaceExecState)
+	s.dtQueuesByPrefix = make(map[string]*dtLocalPrefixQueue)
+	s.dtAssignByPrefix = make(map[string]*dtPrefixFaceAssignState)
+	s.dtLocalFacePrefixes = make(map[uint64][]string)
+	s.dtLocalFaceKnown = make(map[uint64]map[string]bool)
+	s.dtLocalFaceSeen = make(map[uint64]bool)
+	dtControllerOnce.Do(func() {
+		go s.runDtController()
+	})
 }
 
 // Helper to get or create the state for a prefix
@@ -253,8 +398,6 @@ func (s *Multipath) getPathDiscoveryInfo(prefix string) *PathDiscoveryInfo {
 		FrozenFaces:              make(map[uint64]bool),
 		FrozenRecoverFaces:       make(map[uint64]bool),
 		PdInterestQueue:          make([]*InterestQueueItem, 0),
-		TxInterestQueue:          make([]*InterestQueueItem, 0),
-		UpstreamEstimatedBW:      make(map[uint64]float64),
 		UpstreamQsfInterest:      make(map[uint64]float64),
 		UpstreamQsfData:          make(map[uint64]float64),
 		UpstreamQsfInterestSlope: make(map[uint64]float64),
@@ -382,12 +525,9 @@ func (s *Multipath) handleDataTransmissionInterest(
 	inFace uint64,
 	nexthops []*table.FibNextHopEntry,
 ) {
-	// Extract sequence number from interest name and log every 200 packets
+	// Extract sequence number from interest name for sparse DT telemetry.
 	interestName := packet.Name.String()
 	seqNum := extractSeqNum(interestName)
-	if seqNum >= 0 && seqNum%200 == 0 {
-		core.Log.Info(s, "Interest Forwarded", "name", interestName, "seq", seqNum)
-	}
 
 	if len(nexthops) == 0 {
 		core.Log.Warn(s, "No nexthops available for", packet.Name)
@@ -417,28 +557,118 @@ func (s *Multipath) handleDataTransmissionInterest(
 	info := s.getPathDiscoveryInfo(prefixKey)
 	info.mu.Lock()
 	s.ensureDtControlActivated(prefixKey, candidateFaces, time.Now())
+	readyFaces, unreadyFaces := splitDtShapingReadyFaces(candidateFaces)
 
-	// 4. Queue incoming Interest into the DT-specific per-prefix queue
-	info.TxInterestQueue = append(info.TxInterestQueue, &InterestQueueItem{
-		Packet:   packet,
-		PitEntry: pitEntry,
-		InFace:   inFace,
-	})
+	// Pre-shaping bootstrap mode:
+	// If no candidate face is ready for shaped scheduling yet, forward this Interest
+	// immediately using per-prefix RR across all candidate faces.
+	if len(readyFaces) == 0 {
+		bootstrapFace := selectDtBootstrapFaceRRLocked(info, candidateFaces)
+		info.mu.Unlock()
+		s.SendInterest(packet, pitEntry, bootstrapFace, inFace)
+		if seqNum >= 0 && seqNum%200 == 0 {
+			core.Log.Debug(s, "DT immediate bootstrap forward",
+				"name", interestName,
+				"prefix", prefixKey,
+				"face", bootstrapFace,
+				"candidateFaces", candidateFaces)
+		}
+		return
+	}
 
-	// 5. Dequeue immediately (placeholder behavior before rate shaping)
-	queuedItem := info.TxInterestQueue[0]
-	info.TxInterestQueue[0] = nil // release reference
-	info.TxInterestQueue = info.TxInterestQueue[1:]
+	// Partial bootstrap mode:
+	// Start shaped scheduling as soon as any face is ready, but keep probing unready
+	// faces occasionally so their RTT bootstrap can complete. This avoids one slow
+	// face keeping the whole prefix in immediate-forwarding mode indefinitely.
+	if len(unreadyFaces) > 0 && shouldProbeDtUnreadyFaceLocked(info) {
+		bootstrapFace := selectDtBootstrapFaceRRLocked(info, unreadyFaces)
+		info.mu.Unlock()
+		s.SendInterest(packet, pitEntry, bootstrapFace, inFace)
+		if seqNum >= 0 && seqNum%200 == 0 {
+			core.Log.Debug(s, "DT partial bootstrap probe",
+				"name", interestName,
+				"prefix", prefixKey,
+				"face", bootstrapFace,
+				"readyFaces", readyFaces,
+				"unreadyFaces", unreadyFaces)
+		}
+		return
+	}
 
-	// 6. Atomic Round-Robin Selection
-	// THREAD SAFETY: Atomic increment is safe without mutex.
-	currentCount := atomic.AddUint64(&info.RoundRobinCounter, 1) - 1
-	selectedIndex := currentCount % uint64(len(sortedHops))
-	targetFace := sortedHops[selectedIndex].Nexthop
+	assignedFace := s.selectDtAssignedFaceWRR(prefixKey, readyFaces)
+	if assignedFace == 0 {
+		info.mu.Unlock()
+		core.Log.Warn(s, "DT assignment failed: no usable upstream face",
+			"name", interestName,
+			"prefix", prefixKey,
+			"candidateFaces", candidateFaces,
+			"readyFaces", readyFaces,
+			"unreadyFaces", unreadyFaces)
+		return
+	}
+
+	item := &InterestQueueItem{
+		Packet:         packet,
+		PitEntry:       pitEntry,
+		InFace:         inFace,
+		OwnerThreadID:  s.threadID,
+		CandidateFaces: readyFaces,
+		AssignedFace:   assignedFace,
+		EnqueueTime:    time.Now(),
+	}
+	localQueueLen, globalQueueLen := s.enqueueLocalDtInterest(prefixKey, item)
+	if seqNum >= 0 && seqNum%200 == 0 {
+		core.Log.Debug(s, "DT enqueue",
+			"name", interestName,
+			"prefix", prefixKey,
+			"ownerThread", s.threadID,
+			"candidateFaces", candidateFaces,
+			"readyFaces", readyFaces,
+			"unreadyFaces", unreadyFaces,
+			"assignedFace", assignedFace,
+			"localQueueLen", localQueueLen,
+			"globalPrefixQueueLen", globalQueueLen)
+	}
 	info.mu.Unlock()
+}
 
-	// 7. Send dequeued Interest immediately
-	s.SendInterest(queuedItem.Packet, queuedItem.PitEntry, targetFace, queuedItem.InFace)
+func splitDtShapingReadyFaces(candidateFaces []uint64) ([]uint64, []uint64) {
+	readyFaces := make([]uint64, 0, len(candidateFaces))
+	unreadyFaces := make([]uint64, 0, len(candidateFaces))
+	for _, face := range candidateFaces {
+		control := getDtFaceControlState(face)
+		control.mu.Lock()
+		ready := control.activated && control.period > 0 && control.rate > 0
+		control.mu.Unlock()
+		if ready {
+			readyFaces = append(readyFaces, face)
+		} else {
+			unreadyFaces = append(unreadyFaces, face)
+		}
+	}
+	return readyFaces, unreadyFaces
+}
+
+// shouldProbeDtUnreadyFaceLocked limits unshaped bootstrap probes once at least
+// one ready face can carry shaped traffic. THREAD SAFETY: caller must hold info.mu.
+func shouldProbeDtUnreadyFaceLocked(info *PathDiscoveryInfo) bool {
+	info.DtBootstrapProbeCounter++
+	return info.DtBootstrapProbeCounter%dtPartialBootstrapProbeEvery == 0
+}
+
+// selectDtBootstrapFaceRRLocked picks one candidate upstream face in RR order.
+// THREAD SAFETY: caller must hold info.mu.
+func selectDtBootstrapFaceRRLocked(info *PathDiscoveryInfo, candidateFaces []uint64) uint64 {
+	if len(candidateFaces) == 0 {
+		return 0
+	}
+
+	if info.DtBootstrapFaceRR < 0 || info.DtBootstrapFaceRR >= len(candidateFaces) {
+		info.DtBootstrapFaceRR = 0
+	}
+	face := candidateFaces[info.DtBootstrapFaceRR]
+	info.DtBootstrapFaceRR = (info.DtBootstrapFaceRR + 1) % len(candidateFaces)
+	return face
 }
 
 // handlePathDiscoveryInterest implements the ported C++ logic for PD mode
@@ -1215,28 +1445,6 @@ func (s *Multipath) handleTransmissionData(packet *defn.Pkt, pitEntry table.PitE
 		metadataDecoded = true
 		interestQsf = dtPacket.InterestQsf
 		dataQsf = dtPacket.DataQsf
-
-		// Test serialization: Serialize the deserialized packet back to verify it works correctly
-		serializedContent, err := dtPacket.SerializeData()
-		if err != nil {
-			core.Log.Warn(s, "Failed to serialize DataPacket", "err", err, "name", packet.Name)
-		} else {
-			// Verify that serialized content matches original content
-			if len(serializedContent) != len(originalContent) {
-				core.Log.Warn(s, "Serialization size mismatch",
-					"original", len(originalContent),
-					"serialized", len(serializedContent),
-					"name", packet.Name)
-			} else {
-				// Compare serialized content with original content
-				if !bytes.Equal(originalContent, serializedContent) {
-					core.Log.Warn(s, "Serialization content mismatch", "name", packet.Name)
-				} else {
-					// Success - deserialization and serialization work correctly
-					core.Log.Trace(s, "DataPacket serialization test passed", "name", packet.Name)
-				}
-			}
-		}
 	}
 
 	// DT-only per-upstream measurement update (bandwidth + metadata in the same window).
@@ -1248,16 +1456,17 @@ func (s *Multipath) handleTransmissionData(packet *defn.Pkt, pitEntry table.PitE
 	info := s.getPathDiscoveryInfo(prefix)
 	now := time.Now()
 	info.mu.Lock()
-	s.updateDtUpstreamMeasurements(info, prefix, inFace, now, len(originalContent), interestQsf, dataQsf)
+	upstreamEstimatedBW, upstreamMeasuredBW, upstreamBWSamples, upstreamBWRule := s.updateDtUpstreamMeasurements(info, prefix, inFace, now, len(originalContent), interestQsf, dataQsf)
 	s.maybeInitDtControlPeriodFromRtt(info, pitEntry, inFace, now)
-	interestQueueQsf := float64(len(info.TxInterestQueue))
-	upstreamEstimatedBW := info.UpstreamEstimatedBW[inFace]
 	upstreamInterestQsfAvg := info.UpstreamQsfInterest[inFace]
 	upstreamDataQsfAvg := info.UpstreamQsfData[inFace]
 	upstreamInterestQsfSlope := info.UpstreamQsfInterestSlope[inFace]
 	upstreamDataQsfSlope := info.UpstreamQsfDataSlope[inFace]
 	upstreamWindowSamples := len(info.UpstreamSamples[inFace])
 	info.mu.Unlock()
+	interestQueuePackets := float64(globalDtPrefixQueueLen(prefix))
+	interestQueueCapacity := dtGlobalInterestQueueCapacityPackets()
+	interestQueueQsf := normalizeDtQueueSignal(interestQueuePackets, interestQueueCapacity)
 
 	// Extract sequence number from data name and log metadata every 100 packets
 	dataName := packet.Name.String()
@@ -1275,17 +1484,12 @@ func (s *Multipath) handleTransmissionData(packet *defn.Pkt, pitEntry table.PitE
 			"windowAvgDataQsf", upstreamDataQsfAvg,
 			"windowSlopeInterestQsf", upstreamInterestQsfSlope,
 			"windowSlopeDataQsf", upstreamDataQsfSlope,
-			"estimatedBWPps", upstreamEstimatedBW,
+			"estimatedBWPpsFace", upstreamEstimatedBW,
+			"measuredBWPpsFace", upstreamMeasuredBW,
+			"bwSamplesFace", upstreamBWSamples,
+			"bwUpdateRule", upstreamBWRule,
 			"windowSamples", upstreamWindowSamples)
 	}
-	if seqNum >= 0 && seqNum%200 == 0 {
-		core.Log.Info(s, "Data Forwarded",
-			"name", dataName,
-			"seq", seqNum)
-	}
-
-	// DT rate-control rounds are triggered by the forwarding-thread periodic ticker.
-
 	// 3. Forwarding Logic
 	data, ok := parsedData.(*spec.Data)
 	if !ok {
@@ -1297,13 +1501,38 @@ func (s *Multipath) handleTransmissionData(packet *defn.Pkt, pitEntry table.PitE
 	}
 
 	for faceID := range pitEntry.InRecords() {
-		// Update outgoing DT metadata with local queue signals:
-		// - InterestQsf: local per-prefix DT Interest queue size
-		// - DataQsf: downstream face transport send-queue size converted to packet units
+		// Update outgoing DT metadata with this forwarder's queue signals:
+		// - InterestQsf: normalized global per-prefix DT Interest queue occupancy
+		//   across all forwarding-thread shards for this node
+		// - DataQsf: downstream face queue pressure selected by dtDataQsfSource
 		downstreamDataQsf := 0.0
+		rawDownstreamDataQsf := 0.0
+		downstreamDataQsfCapacity := 1.0
+		transportQueueBytes := uint64(0)
+		transportQueuePacketsApprox := 0.0
+		linkQueuePackets := uint64(0)
+		linkBacklogBytes := uint64(0)
+		linkBacklogPackets := uint64(0)
+		linkBacklogQsf := 0.0
 		if outFace := dispatch.GetFace(faceID); outFace != nil {
-			queueBytes := outFace.GetSendQueueSize()
-			downstreamDataQsf = float64(queueBytes) / float64(dataPayloadSizeBytes)
+			transportQueueBytes = outFace.GetSendQueueSize()
+			linkQueuePackets = outFace.GetLinkSendQueueLen()
+			linkBacklogBytes = outFace.GetLinkBacklogBytes()
+			linkBacklogPackets = outFace.GetLinkBacklogPackets()
+			transportQueuePacketsApprox = float64(transportQueueBytes) / float64(dataPayloadSizeBytes)
+			linkBacklogQsf = normalizeDtQueueSignal(float64(linkBacklogPackets), dtQdiscQueueCapacityPackets)
+			switch dtDataQsfSource {
+			case "qdisc":
+				rawDownstreamDataQsf = float64(linkBacklogPackets)
+				downstreamDataQsfCapacity = dtQdiscQueueCapacityPackets
+			case "link-service":
+				rawDownstreamDataQsf = float64(linkQueuePackets)
+				downstreamDataQsfCapacity = dtLinkServiceQueueCapacityPackets
+			default:
+				rawDownstreamDataQsf = transportQueuePacketsApprox
+				downstreamDataQsfCapacity = dtInterestQueueCapacityPackets
+			}
+			downstreamDataQsf = normalizeDtQueueSignal(rawDownstreamDataQsf, downstreamDataQsfCapacity)
 		} else {
 			core.Log.Warn(s, "Downstream face missing while updating DT metadata", "faceid", faceID, "name", packet.Name)
 		}
@@ -1312,6 +1541,28 @@ func (s *Multipath) handleTransmissionData(packet *defn.Pkt, pitEntry table.PitE
 		if dtPacket == nil {
 			s.SendData(packet, pitEntry, faceID, inFace)
 			continue
+		}
+
+		if seqNum >= 0 && seqNum%100 == 0 {
+			core.Log.Debug(s, "DT metadata attached",
+				"name", dataName,
+				"seq", seqNum,
+				"inFace", inFace,
+				"outFace", faceID,
+				"interestQueuePackets", interestQueuePackets,
+				"interestQsfCapacity", interestQueueCapacity,
+				"interestQsfAttached", interestQueueQsf,
+				"dataQsfSource", dtDataQsfSource,
+				"dataQsfRaw", rawDownstreamDataQsf,
+				"dataQsfCapacity", downstreamDataQsfCapacity,
+				"dataQsfAttached", downstreamDataQsf,
+				"transportQueueBytes", transportQueueBytes,
+				"transportQueuePacketsApprox", transportQueuePacketsApprox,
+				"linkSendQueuePackets", linkQueuePackets,
+				"qdiscBacklogBytes", linkBacklogBytes,
+				"qdiscBacklogPackets", linkBacklogPackets,
+				"qdiscBacklogQsf", linkBacklogQsf,
+				"payloadBytes", dataPayloadSizeBytes)
 		}
 
 		faceDtPacket := *dtPacket
@@ -1351,6 +1602,485 @@ func getDtFaceControlState(face uint64) *dtFaceControlState {
 	return val.(*dtFaceControlState)
 }
 
+func getDtFaceBandwidthState(face uint64) *dtFaceBandwidthState {
+	val, _ := dtFaceBandwidthByFace.LoadOrStore(face, &dtFaceBandwidthState{})
+	return val.(*dtFaceBandwidthState)
+}
+
+func getDtGlobalPrefixQueueState(prefix string) *dtGlobalPrefixQueueState {
+	val, _ := dtGlobalPrefixQueueByPrefix.LoadOrStore(prefix, &dtGlobalPrefixQueueState{})
+	return val.(*dtGlobalPrefixQueueState)
+}
+
+func noteDtGlobalPrefixQueue(prefix string, delta int) int {
+	if delta == 0 {
+		return globalDtPrefixQueueLen(prefix)
+	}
+	state := getDtGlobalPrefixQueueState(prefix)
+	next := state.length.Add(int64(delta))
+	if next < 0 {
+		state.length.Store(0)
+		return 0
+	}
+	return int(next)
+}
+
+func globalDtPrefixQueueLen(prefix string) int {
+	state := getDtGlobalPrefixQueueState(prefix)
+	current := state.length.Load()
+	if current < 0 {
+		return 0
+	}
+	return int(current)
+}
+
+func (s *Multipath) getDtThreadFaceExecState(face uint64) *dtThreadFaceExecState {
+	if state, ok := s.dtExecByFace[face]; ok {
+		return state
+	}
+	state := &dtThreadFaceExecState{}
+	s.dtExecByFace[face] = state
+	return state
+}
+
+func (s *Multipath) getDtPrefixAssignState(prefix string) *dtPrefixFaceAssignState {
+	state := s.dtAssignByPrefix[prefix]
+	if state == nil {
+		state = &dtPrefixFaceAssignState{
+			credits:     make(map[uint64]float64),
+			assignCount: make(map[uint64]uint64),
+		}
+		s.dtAssignByPrefix[prefix] = state
+	}
+	return state
+}
+
+func dtCurrentFaceWeight(face uint64) float64 {
+	control := getDtFaceControlState(face)
+	control.mu.Lock()
+	rate := control.rate
+	control.mu.Unlock()
+	if rate <= 0 {
+		rate = 1
+	}
+	return rate
+}
+
+// selectDtAssignedFaceWRR assigns one Interest to exactly one upstream face.
+// It uses per-thread, per-prefix smooth weighted RR with current face rates as
+// weights. This prevents multiple face schedulers from racing for the same IQ item.
+func (s *Multipath) selectDtAssignedFaceWRR(prefix string, candidateFaces []uint64) uint64 {
+	if len(candidateFaces) == 0 {
+		return 0
+	}
+
+	state := s.getDtPrefixAssignState(prefix)
+	var totalWeight float64
+	var selected uint64
+	bestCredit := math.Inf(-1)
+
+	live := make(map[uint64]bool, len(candidateFaces))
+	for _, face := range candidateFaces {
+		live[face] = true
+		weight := dtCurrentFaceWeight(face)
+		totalWeight += weight
+		state.credits[face] += weight
+		if selected == 0 || state.credits[face] > bestCredit || (state.credits[face] == bestCredit && face < selected) {
+			selected = face
+			bestCredit = state.credits[face]
+		}
+	}
+	for face := range state.credits {
+		if !live[face] {
+			delete(state.credits, face)
+			delete(state.assignCount, face)
+		}
+	}
+	if selected == 0 {
+		return 0
+	}
+	state.credits[selected] -= totalWeight
+	state.assignCount[selected]++
+	state.logCount++
+
+	if state.logCount%200 == 0 {
+		core.Log.Debug(s, "DT assignment summary",
+			"thread", s.threadID,
+			"prefix", prefix,
+			"candidateFaces", candidateFaces,
+			"assignedFace", selected,
+			"assignCounts", state.assignCount,
+			"credits", state.credits)
+	}
+	return selected
+}
+
+func (s *Multipath) enqueueLocalDtInterest(prefix string, item *InterestQueueItem) (int, int) {
+	state := s.dtQueuesByPrefix[prefix]
+	if state == nil {
+		state = &dtLocalPrefixQueue{prefix: prefix}
+		s.dtQueuesByPrefix[prefix] = state
+	}
+
+	state.queue = append(state.queue, item)
+	globalQueueLen := noteDtGlobalPrefixQueue(prefix, 1)
+	if item.AssignedFace != 0 {
+		s.noteLocalPrefixEligibleForFace(item.AssignedFace, prefix)
+		noteDtThreadDemand(item.AssignedFace, s.threadID, 1)
+	}
+	return len(state.queue), globalQueueLen
+}
+
+func (s *Multipath) noteLocalPrefixEligibleForFace(face uint64, prefix string) {
+	if !s.dtLocalFaceSeen[face] {
+		s.dtLocalFaceSeen[face] = true
+		s.dtLocalFaceOrder = append(s.dtLocalFaceOrder, face)
+	}
+
+	known := s.dtLocalFaceKnown[face]
+	if known == nil {
+		known = make(map[string]bool)
+		s.dtLocalFaceKnown[face] = known
+	}
+	if known[prefix] {
+		return
+	}
+	known[prefix] = true
+	s.dtLocalFacePrefixes[face] = append(s.dtLocalFacePrefixes[face], prefix)
+}
+
+// localPendingInterestsForFace returns queued DT interests owned by this
+// forwarding thread that are currently eligible to be sent on upstreamFace.
+func (s *Multipath) localPendingInterestsForFace(upstreamFace uint64) int {
+	control := getDtFaceControlState(upstreamFace)
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	ensureDtControlThreadSlotsLocked(control)
+	if s.threadID >= len(control.demandByThread) {
+		return 0
+	}
+	return control.demandByThread[s.threadID]
+}
+
+// dequeueDtInterestForFaceRR pops one local PIT-owned DT interest using RR across
+// this forwarding thread's local prefix queues. It never touches another thread's PIT.
+func (s *Multipath) dequeueDtInterestForFaceRR(upstreamFace uint64, exec *dtThreadFaceExecState) *InterestQueueItem {
+	prefixes := s.dtLocalFacePrefixes[upstreamFace]
+	if len(prefixes) == 0 {
+		return nil
+	}
+
+	start := int(exec.prefixRR % uint64(len(prefixes)))
+	for i := 0; i < len(prefixes); i++ {
+		idx := (start + i) % len(prefixes)
+		state := s.dtQueuesByPrefix[prefixes[idx]]
+		if state == nil || len(state.queue) == 0 {
+			continue
+		}
+
+		itemIdx := -1
+		var item *InterestQueueItem
+		for j, candidate := range state.queue {
+			if candidate != nil && candidate.OwnerThreadID == s.threadID && candidate.AssignedFace == upstreamFace {
+				itemIdx = j
+				item = candidate
+				break
+			}
+		}
+		if itemIdx < 0 {
+			continue
+		}
+
+		copy(state.queue[itemIdx:], state.queue[itemIdx+1:])
+		state.queue[len(state.queue)-1] = nil
+		state.queue = state.queue[:len(state.queue)-1]
+		noteDtGlobalPrefixQueue(prefixes[idx], -1)
+		if item.AssignedFace != 0 {
+			noteDtThreadDemand(item.AssignedFace, s.threadID, -1)
+		}
+		exec.prefixRR = uint64(idx + 1)
+		return item
+	}
+
+	return nil
+}
+
+func ensureDtControlThreadSlotsLocked(control *dtFaceControlState) {
+	n := CfgNumThreads()
+	if n <= 0 {
+		n = 1
+	}
+	if len(control.demandByThread) < n {
+		next := make([]int, n)
+		copy(next, control.demandByThread)
+		control.demandByThread = next
+	}
+	if len(control.budgetByThread) < n {
+		next := make([]int, n)
+		copy(next, control.budgetByThread)
+		control.budgetByThread = next
+	}
+	if control.budgetRR >= n {
+		control.budgetRR = 0
+	}
+}
+
+func noteDtThreadDemand(face uint64, threadID int, delta int) {
+	if threadID < 0 {
+		return
+	}
+	control := getDtFaceControlState(face)
+	control.mu.Lock()
+	ensureDtControlThreadSlotsLocked(control)
+	if threadID < len(control.demandByThread) {
+		control.demandByThread[threadID] += delta
+		if control.demandByThread[threadID] < 0 {
+			control.demandByThread[threadID] = 0
+		}
+		if control.demandByThread[threadID] == 0 && threadID < len(control.budgetByThread) {
+			control.budgetByThread[threadID] = 0
+		}
+	}
+	control.mu.Unlock()
+}
+
+func takeDtThreadBudget(face uint64, threadID int, maxPackets int) int {
+	if threadID < 0 || maxPackets <= 0 {
+		return 0
+	}
+	control := getDtFaceControlState(face)
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	ensureDtControlThreadSlotsLocked(control)
+	if threadID >= len(control.budgetByThread) {
+		return 0
+	}
+	if control.budgetByThread[threadID] <= 0 {
+		return 0
+	}
+	grant := control.budgetByThread[threadID]
+	if grant > maxPackets {
+		grant = maxPackets
+	}
+	control.budgetByThread[threadID] -= grant
+	return grant
+}
+
+func refillDtFaceTokensLocked(control *dtFaceControlState, now time.Time) {
+	if control.lastRefill.IsZero() {
+		control.lastRefill = now
+	}
+	elapsed := now.Sub(control.lastRefill).Seconds()
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	control.tokens += elapsed * control.rate
+	maxBurst := dtFaceTokenBurstCapPackets
+	if control.tokens > maxBurst {
+		control.tokens = maxBurst
+	}
+	control.lastRefill = now
+}
+
+func (s *Multipath) allocateDtFaceBudgets(upstreamFace uint64, now time.Time) {
+	control := getDtFaceControlState(upstreamFace)
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	if !control.activated || control.period <= 0 || control.rate <= 0 {
+		return
+	}
+
+	ensureDtControlThreadSlotsLocked(control)
+	refillDtFaceTokensLocked(control, now)
+	grant := int(control.tokens)
+	if grant > 0 {
+		control.tokens -= float64(grant)
+	}
+
+	if grant < 1 && control.livenessForcedPackets > 0 {
+		grant = 1
+		control.livenessForcedPackets--
+	}
+
+	if grant <= 0 {
+		return
+	}
+
+	totalDemand := 0
+	activeThreads := 0
+	for _, demand := range control.demandByThread {
+		totalDemand += demand
+		if demand > 0 {
+			activeThreads++
+		}
+	}
+	if activeThreads == 0 {
+		for tid := range control.budgetByThread {
+			control.budgetByThread[tid] = 0
+		}
+		control.tokens += float64(grant)
+		return
+	}
+
+	remaining := grant
+	nThreads := len(control.demandByThread)
+	start := control.budgetRR
+	for remaining > 0 {
+		progress := false
+		for i := 0; i < nThreads && remaining > 0; i++ {
+			tid := (start + i) % nThreads
+			if control.demandByThread[tid] <= 0 || control.budgetByThread[tid] >= dtThreadBudgetCapPackets {
+				continue
+			}
+			control.budgetByThread[tid]++
+			remaining--
+			progress = true
+			control.budgetRR = (tid + 1) % nThreads
+		}
+		if !progress {
+			control.tokens += float64(remaining)
+			break
+		}
+	}
+
+	control.budgetRounds++
+	if control.budgetRounds%dtControllerDebugRounds == 0 {
+		totalBudget := 0
+		for _, budget := range control.budgetByThread {
+			totalBudget += budget
+		}
+		core.Log.Debug(s, "DT budget allocation",
+			"face", upstreamFace,
+			"grant", grant,
+			"activeThreads", activeThreads,
+			"totalDemand", totalDemand,
+			"totalBudget", totalBudget,
+			"rate", control.rate,
+			"period", control.period,
+			"tokens", control.tokens)
+	}
+}
+
+func noteDtFaceSentPackets(face uint64, sent int) {
+	if sent <= 0 {
+		return
+	}
+	control := getDtFaceControlState(face)
+	control.mu.Lock()
+	control.sentCounter += uint64(sent)
+	control.mu.Unlock()
+}
+
+func (s *Multipath) drainLocalDtQueues(now time.Time) {
+	if len(s.dtLocalFaceOrder) == 0 {
+		return
+	}
+
+	visits := len(s.dtLocalFaceOrder)
+	if visits > dtSchedulerMaxFacesPerTick {
+		visits = dtSchedulerMaxFacesPerTick
+	}
+	for i := 0; i < visits; i++ {
+		idx := int(s.dtLocalFaceRR % uint64(len(s.dtLocalFaceOrder)))
+		s.dtLocalFaceRR++
+		face := s.dtLocalFaceOrder[idx]
+		s.drainDtInterestForFace(now, face)
+	}
+}
+
+func (s *Multipath) drainDtInterestForFace(now time.Time, upstreamFace uint64) {
+	pending := s.localPendingInterestsForFace(upstreamFace)
+	if pending == 0 {
+		return
+	}
+
+	exec := s.getDtThreadFaceExecState(upstreamFace)
+	exec.tickCount++
+
+	budget := takeDtThreadBudget(upstreamFace, s.threadID, dtSchedulerMaxSendPerTick)
+	if budget <= 0 {
+		exec.tokenMisses++
+		s.logDtSchedulerSummary(now, upstreamFace, exec, pending)
+		return
+	}
+
+	used := 0
+	for sent := 0; sent < budget; sent++ {
+		item := s.dequeueDtInterestForFaceRR(upstreamFace, exec)
+		if item == nil {
+			exec.emptyDequeues++
+			break
+		}
+		if s.SendInterest(item.Packet, item.PitEntry, upstreamFace, item.InFace) {
+			exec.sentShaped++
+			used++
+		}
+		if !item.EnqueueTime.IsZero() {
+			age := now.Sub(item.EnqueueTime)
+			if age < 0 {
+				age = 0
+			}
+			exec.sendAgeTotal += age
+			if age > exec.sendAgeMax {
+				exec.sendAgeMax = age
+			}
+			if age >= 100*time.Millisecond {
+				exec.staleSends++
+			}
+		}
+	}
+	noteDtFaceSentPackets(upstreamFace, used)
+	s.logDtSchedulerSummary(now, upstreamFace, exec, pending)
+}
+
+func (s *Multipath) logDtSchedulerSummary(now time.Time, upstreamFace uint64, exec *dtThreadFaceExecState, pending int) {
+	if exec.tickCount%dtSchedulerDebugEveryTicks != 0 {
+		return
+	}
+
+	control := getDtFaceControlState(upstreamFace)
+	control.mu.Lock()
+	currentRate := control.rate
+	currentPeriod := control.period
+	currentBudget := 0
+	currentDemand := 0
+	if s.threadID < len(control.budgetByThread) {
+		currentBudget = control.budgetByThread[s.threadID]
+	}
+	if s.threadID < len(control.demandByThread) {
+		currentDemand = control.demandByThread[s.threadID]
+	}
+	control.mu.Unlock()
+
+	totalSent := exec.sentBootstrap + exec.sentShaped
+	ageAvgMs := 0.0
+	if totalSent > 0 {
+		ageAvgMs = float64(exec.sendAgeTotal.Microseconds()) / 1000.0 / float64(totalSent)
+	}
+	core.Log.Debug(s, "DT local scheduler",
+		"thread", s.threadID,
+		"face", upstreamFace,
+		"rate", dtLogFloat1(currentRate),
+		"period", currentPeriod,
+		"pendingLocal", pending,
+		"demandThread", currentDemand,
+		"budgetThread", currentBudget,
+		"sentShaped", exec.sentShaped,
+		"emptyDequeues", exec.emptyDequeues,
+		"tokenMisses", exec.tokenMisses,
+		"sendAgeAvgMs", dtLogFloat1(ageAvgMs),
+		"sendAgeMaxMs", dtLogFloat1(float64(exec.sendAgeMax.Microseconds())/1000.0),
+		"staleSends", exec.staleSends,
+		"now", now)
+	exec.sentBootstrap = 0
+	exec.sentShaped = 0
+	exec.emptyDequeues = 0
+	exec.tokenMisses = 0
+	exec.sendAgeTotal = 0
+	exec.sendAgeMax = 0
+	exec.staleSends = 0
+}
+
 // updateDtFaceInterestSignal keeps per-prefix signal snapshots for one upstream face.
 // It reuses existing sliding-window outputs and adds no packet-level metadata overhead.
 func (s *Multipath) updateDtFaceInterestSignal(
@@ -1360,7 +2090,6 @@ func (s *Multipath) updateDtFaceInterestSignal(
 	interestSlope float64,
 	dataQ float64,
 	dataSlope float64,
-	bwPps float64,
 	sampleCount int,
 	sampleTime time.Time,
 ) {
@@ -1371,26 +2100,23 @@ func (s *Multipath) updateDtFaceInterestSignal(
 		InterestSlope: interestSlope,
 		DataQ:         dataQ,
 		DataSlope:     dataSlope,
-		BWPps:         bwPps,
 		SampleCount:   sampleCount,
 		LastUpdated:   sampleTime,
 	}
 	state.mu.Unlock()
 }
 
-// getAveragedDtFaceSignal returns face-level signals across prefixes for one upstream face.
-// Queue-related signals are weighted averages across prefixes.
-// Bandwidth signal is total pps summed across live prefixes (not averaged).
-func (s *Multipath) getAveragedDtFaceSignal(face uint64) (float64, float64, float64, float64, float64, int) {
+// getAveragedDtFaceQueueSignal returns face-level queue signals across prefixes.
+// Queue-related signals are weighted averages across live prefix windows.
+func (s *Multipath) getAveragedDtFaceQueueSignal(face uint64, now time.Time) (float64, float64, float64, float64, int) {
 	state := getDtFaceInterestSignalState(face)
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
 	if len(state.byPref) == 0 {
-		return 0, 0, 0, 0, 0, 0
+		return 0, 0, 0, 0, 0
 	}
 
-	now := time.Now()
 	liveCutoff := now.Add(-dtThroughputWindowDur)
 
 	var sumW float64
@@ -1398,10 +2124,8 @@ func (s *Multipath) getAveragedDtFaceSignal(face uint64) (float64, float64, floa
 	var sumIQSlope float64
 	var sumDQ float64
 	var sumDQSlope float64
-	var sumBWTotal float64
 	var countedPrefixes int
 	for prefix, signal := range state.byPref {
-		// Prefix is live only if it still has a recent sample inside window.
 		if signal.LastUpdated.Before(liveCutoff) {
 			delete(state.byPref, prefix)
 			continue
@@ -1415,15 +2139,23 @@ func (s *Multipath) getAveragedDtFaceSignal(face uint64) (float64, float64, floa
 		sumIQSlope += w * signal.InterestSlope
 		sumDQ += w * signal.DataQ
 		sumDQSlope += w * signal.DataSlope
-		sumBWTotal += signal.BWPps
 		countedPrefixes++
 	}
 
-	if sumW <= 0 {
-		return 0, 0, 0, 0, 0, 0
+	if countedPrefixes <= 0 || sumW <= 0 {
+		return 0, 0, 0, 0, countedPrefixes
 	}
 
-	return sumIQ / sumW, sumIQSlope / sumW, sumDQ / sumW, sumDQSlope / sumW, sumBWTotal, countedPrefixes
+	return sumIQ / sumW, sumIQSlope / sumW, sumDQ / sumW, sumDQSlope / sumW, countedPrefixes
+}
+
+// getAveragedDtFaceSignal combines per-face queue signals with the per-face
+// bandwidth estimator. Bandwidth is never summed across prefixes.
+func (s *Multipath) getAveragedDtFaceSignal(face uint64) (float64, float64, float64, float64, float64, int) {
+	now := time.Now()
+	interestQ, interestSlope, dataQ, dataSlope, prefixes := s.getAveragedDtFaceQueueSignal(face, now)
+	bw, _, _, _ := s.getDtFaceBandwidthEstimate(face, now)
+	return interestQ, interestSlope, dataQ, dataSlope, bw, prefixes
 }
 
 func clampDtControlPeriod(p time.Duration) time.Duration {
@@ -1442,6 +2174,9 @@ func getDtRttBootstrapState(face uint64) *dtRttBootstrapState {
 }
 
 func getDtRttBootstrapPeriod(face uint64) (bool, time.Duration, int) {
+	if dtUseStaticControlPeriod {
+		return true, dtStaticControlPeriod, 0
+	}
 	state := getDtRttBootstrapState(face)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -1449,6 +2184,9 @@ func getDtRttBootstrapPeriod(face uint64) (bool, time.Duration, int) {
 }
 
 func recordDtRttBootstrapSample(face uint64, rtt time.Duration) (bool, time.Duration, int) {
+	if dtUseStaticControlPeriod {
+		return true, dtStaticControlPeriod, 0
+	}
 	if rtt <= 0 {
 		return false, 0, 0
 	}
@@ -1487,7 +2225,8 @@ func (s *Multipath) ensureDtControlActivated(
 		control.mu.Lock()
 		if !control.activated {
 			control.activated = true
-			core.Log.Info(s, "DT periodic control activated", "prefix", prefix, "face", face)
+			core.Log.Info(s, "DT periodic control activated",
+				"prefix", prefix, "face", face)
 		}
 
 		if control.period <= 0 {
@@ -1497,6 +2236,7 @@ func (s *Multipath) ensureDtControlActivated(
 				control.nextRun = now
 				core.Log.Info(s, "DT control period ready from bootstrap history",
 					"prefix", prefix, "face", face, "period", period, "rttSamples", samples,
+					"staticControlPeriod", dtUseStaticControlPeriod,
 					"periodScale", dtControlPeriodRttScale)
 			}
 		}
@@ -1542,12 +2282,22 @@ func (s *Multipath) maybeInitDtControlPeriodFromRtt(
 
 	core.Log.Info(s, "DT control period initialized",
 		"prefix", info.Prefix, "face", upstreamFace, "period", period, "rttSamples", samples,
+		"staticControlPeriod", dtUseStaticControlPeriod,
 		"periodScale", dtControlPeriodRttScale)
 }
 
-// OnTick runs periodic DT per-face rate control.
-// This keeps control scheduling independent from Interest/Data/Nack packet arrivals.
-func (s *Multipath) OnTick(now time.Time) {
+func (s *Multipath) runDtController() {
+	ticker := time.NewTicker(dtControllerTick)
+	defer ticker.Stop()
+
+	core.Log.Info(s, "DT controller started", "period", dtControllerTick)
+	for !core.ShouldQuit {
+		now := <-ticker.C
+		s.runDtControllerTick(now)
+	}
+}
+
+func (s *Multipath) runDtControllerTick(now time.Time) {
 	dtFaceControlByFace.Range(func(key, value any) bool {
 		face, ok := key.(uint64)
 		if !ok {
@@ -1572,8 +2322,15 @@ func (s *Multipath) OnTick(now time.Time) {
 		if shouldRun {
 			s.faceSendRateEstimationCore(face)
 		}
+		s.allocateDtFaceBudgets(face, now)
 		return true
 	})
+}
+
+// OnTick only drains this forwarding thread's local, PIT-owned DT queues.
+// Global face-rate control and budget allocation run in the PIT-free DT controller goroutine.
+func (s *Multipath) OnTick(now time.Time) {
+	s.drainLocalDtQueues(now)
 }
 
 func initDtEstimatorTunables() {
@@ -1596,11 +2353,96 @@ func initDtEstimatorTunables() {
 	})
 }
 
+func trimDtFaceBandwidthSamples(samples []time.Time, now time.Time) []time.Time {
+	cutoff := now.Add(-dtThroughputWindowDur)
+	validIdx := len(samples)
+	for i, sampleTime := range samples {
+		if !sampleTime.Before(cutoff) {
+			validIdx = i
+			break
+		}
+	}
+	samples = samples[validIdx:]
+	if len(samples) > dtMaxSamplesPerFace {
+		samples = samples[len(samples)-dtMaxSamplesPerFace:]
+	}
+	return samples
+}
+
+func (s *Multipath) updateDtFaceBandwidthEstimate(upstreamFace uint64, now time.Time) (float64, float64, int, string) {
+	state := getDtFaceBandwidthState(upstreamFace)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	state.samples = append(state.samples, now)
+	state.samples = trimDtFaceBandwidthSamples(state.samples, now)
+	sampleCount := len(state.samples)
+	measuredPPS := 0.0
+	if sampleCount > 0 && dtThroughputWindowDur.Seconds() > 0 {
+		measuredPPS = float64(sampleCount) / dtThroughputWindowDur.Seconds()
+	}
+
+	prevBW := state.estimatedPps
+	updateRule := "retain"
+	switch {
+	case measuredPPS <= 0 && prevBW > 0:
+		updateRule = "no-sample-retain"
+	case prevBW <= 0:
+		state.estimatedPps = measuredPPS
+		updateRule = "bootstrap"
+	case measuredPPS > prevBW:
+		if sampleCount >= dtBandwidthDirectAdoptMinSamples {
+			state.estimatedPps = measuredPPS
+			updateRule = "new-throughput-high"
+		} else {
+			state.estimatedPps = (dtBandwidthDecayPrevWeight * prevBW) + (dtBandwidthDecayMeasuredWeight * measuredPPS)
+			updateRule = "new-throughput-high-smoothed"
+		}
+	case measuredPPS < prevBW:
+		state.estimatedPps = (dtBandwidthDecayPrevWeight * prevBW) + (dtBandwidthDecayMeasuredWeight * measuredPPS)
+		updateRule = "ewma-decay"
+	default:
+		state.estimatedPps = prevBW
+	}
+
+	state.lastUpdated = now
+	state.lastUpdateRule = updateRule
+	state.lastMeasuredPps = measuredPPS
+	return state.estimatedPps, measuredPPS, sampleCount, updateRule
+}
+
+func (s *Multipath) getDtFaceBandwidthEstimate(upstreamFace uint64, now time.Time) (float64, float64, int, string) {
+	state := getDtFaceBandwidthState(upstreamFace)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	state.samples = trimDtFaceBandwidthSamples(state.samples, now)
+	sampleCount := len(state.samples)
+	measuredPPS := 0.0
+	if sampleCount > 0 && dtThroughputWindowDur.Seconds() > 0 {
+		measuredPPS = float64(sampleCount) / dtThroughputWindowDur.Seconds()
+	}
+	if sampleCount > 0 {
+		state.lastMeasuredPps = measuredPPS
+		return state.estimatedPps, measuredPPS, sampleCount, state.lastUpdateRule
+	}
+	if state.estimatedPps > 0 && now.Sub(state.lastNoSampleWarn) >= dtBandwidthNoSampleWarnInterval {
+		state.lastNoSampleWarn = now
+		core.Log.Warn(s, "DT BW estimate retained without fresh samples",
+			"face", upstreamFace,
+			"retainedBWPps", state.estimatedPps,
+			"lastMeasuredBWPps", state.lastMeasuredPps,
+			"lastUpdateRule", state.lastUpdateRule,
+			"staleFor", now.Sub(state.lastUpdated))
+	}
+	return state.estimatedPps, 0, 0, "no-sample-retain"
+}
+
 // updateDtUpstreamMeasurements maintains DT per-upstream sliding-window measurements.
 // It updates:
-//  1. bandwidth estimate in packets/sec and
-//  2. average InterestQsf/DataQsf metadata
-//  3. InterestQsf/DataQsf trend slopes (units: qsf per second), computed via
+//  1. per-face bandwidth estimate in packets/sec
+//  2. per-prefix/per-upstream average InterestQsf/DataQsf metadata
+//  3. per-prefix/per-upstream InterestQsf/DataQsf trend slopes (units: qsf per second), computed via
 //     exponentially weighted linear regression (newer samples weighted more)
 //
 // using the same static window duration.
@@ -1613,7 +2455,7 @@ func (s *Multipath) updateDtUpstreamMeasurements(
 	payloadSize int,
 	interestQsf float64,
 	dataQsf float64,
-) {
+) (float64, float64, int, string) {
 	samples := info.UpstreamSamples[upstreamFace]
 	samples = append(samples, DtUpstreamSample{
 		Timestamp:   now,
@@ -1637,17 +2479,13 @@ func (s *Multipath) updateDtUpstreamMeasurements(
 	info.UpstreamSamples[upstreamFace] = samples
 
 	if len(samples) == 0 {
-		info.UpstreamEstimatedBW[upstreamFace] = 0
 		info.UpstreamQsfInterest[upstreamFace] = 0
 		info.UpstreamQsfData[upstreamFace] = 0
 		info.UpstreamQsfInterestSlope[upstreamFace] = 0
 		info.UpstreamQsfDataSlope[upstreamFace] = 0
-		s.updateDtFaceInterestSignal(upstreamFace, prefix, 0, 0, 0, 0, 0, 0, now)
-		return
+		s.updateDtFaceInterestSignal(upstreamFace, prefix, 0, 0, 0, 0, 0, now)
+		return s.getDtFaceBandwidthEstimate(upstreamFace, now)
 	}
-
-	measuredPPS := float64(len(samples)) / dtThroughputWindowDur.Seconds()
-	info.UpstreamEstimatedBW[upstreamFace] = measuredPPS
 
 	var sumInterestQsf float64
 	var sumDataQsf float64
@@ -1702,17 +2540,17 @@ func (s *Multipath) updateDtUpstreamMeasurements(
 		interestSlope,
 		info.UpstreamQsfData[upstreamFace],
 		dataSlope,
-		info.UpstreamEstimatedBW[upstreamFace],
 		len(samples),
 		now,
 	)
+	return s.updateDtFaceBandwidthEstimate(upstreamFace, now)
 }
 
 // faceSendRateEstimationCore performs one per-upstream-face control round.
 // All input signals and control state are aggregated/stored at face level.
 func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 	// Step 1: derive queue signal from face-level aggregates across prefixes.
-	interestQ, interestSlope, dataQ, dataSlope, estimatedBWFaceTotal, prefixes := s.getAveragedDtFaceSignal(upstreamFace)
+	interestQ, interestSlope, dataQ, dataSlope, estimatedBWFace, prefixes := s.getAveragedDtFaceSignal(upstreamFace)
 	if prefixes <= 0 {
 		return
 	}
@@ -1728,8 +2566,21 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 	}
 
 	control := getDtFaceControlState(upstreamFace)
+	roundNow := time.Now()
+	pendingFace := s.pendingDtInterestsForFace(upstreamFace)
 	control.mu.Lock()
 	prevRate := control.rate
+	measuredSendPps := 0.0
+	hadPrevRateSample := !control.lastRateSampleTime.IsZero()
+	if hadPrevRateSample {
+		elapsed := roundNow.Sub(control.lastRateSampleTime).Seconds()
+		if elapsed > 0 {
+			delta := control.sentCounter - control.lastRateSampleCount
+			measuredSendPps = float64(delta) / elapsed
+		}
+	}
+	control.lastRateSampleTime = roundNow
+	control.lastRateSampleCount = control.sentCounter
 	currentRate := prevRate
 	if currentRate <= 0 {
 		currentRate = dtRateControlParams.FwdMinRate
@@ -1760,15 +2611,15 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 		primaryAction = DtActionHoldDraining
 	} else {
 		if queueSlope > slopeThreshold {
-			if estimatedBWFaceTotal > 0 {
-				newRate = estimatedBWFaceTotal * dtRateControlParams.FwdCIFactor
+			if estimatedBWFace > 0 {
+				newRate = estimatedBWFace * dtRateControlParams.FwdCIFactor
 			} else {
 				newRate = currentRate * dtRateControlParams.FwdCIFactor
 			}
 			primaryAction = DtActionCautiousIncrease
 		} else {
-			if estimatedBWFaceTotal > 0 {
-				newRate = estimatedBWFaceTotal * dtRateControlParams.FwdRPFactor
+			if estimatedBWFace > 0 {
+				newRate = estimatedBWFace * dtRateControlParams.FwdRPFactor
 			} else {
 				newRate = currentRate * dtRateControlParams.FwdRPFactor
 			}
@@ -1778,14 +2629,14 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 
 	// Step 5: Bandwidth safety guard.
 	finalAction := primaryAction
-	if estimatedBWFaceTotal > 0 {
-		maxSafeRate := estimatedBWFaceTotal * dtRateControlParams.MaxBWSafetyRatio
+	if estimatedBWFace > 0 {
+		maxSafeRate := estimatedBWFace * dtRateControlParams.MaxBWSafetyRatio
 		if newRate > maxSafeRate {
 			newRate = maxSafeRate
 			finalAction = DtActionBWCapped
 		}
 
-		minSafeRate := estimatedBWFaceTotal * dtRateControlParams.MinBWSafetyRatio
+		minSafeRate := estimatedBWFace * dtRateControlParams.MinBWSafetyRatio
 		if newRate < minSafeRate {
 			newRate = minSafeRate
 			finalAction = DtActionBWBoosted
@@ -1802,37 +2653,95 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 		finalAction = DtActionGlobalMaxCapped
 	}
 
+	// Liveness guard:
+	// If this face has pending demand but measured send rate is zero in this control round,
+	// prime a tiny forced packet budget for upcoming scheduler ticks.
+	if hadPrevRateSample && pendingFace > 0 && measuredSendPps <= 0 {
+		control.starvationZeroSendRounds++
+		control.livenessForcedPackets += dtLivenessForcedPacketsPerStarvedRound
+		if control.livenessForcedPackets > dtLivenessForcedPacketsMax {
+			control.livenessForcedPackets = dtLivenessForcedPacketsMax
+		}
+	} else if pendingFace == 0 || measuredSendPps > 0 {
+		control.starvationZeroSendRounds = 0
+	}
+	starvationRounds := control.starvationZeroSendRounds
+	livenessForcedPackets := control.livenessForcedPackets
+
 	// Step 7: persist and emit concise per-round telemetry.
 	control.rate = newRate
 	control.action = finalAction
 	control.mu.Unlock()
 
-	bwMbpsFaceTotal := 0.0
-	if estimatedBWFaceTotal > 0 {
+	bwMbpsFace := 0.0
+	if estimatedBWFace > 0 {
 		packetBytes := dtDataPacketSizeBytes
 		if packetBytes <= 0 {
 			packetBytes = datapacket.NewDataPacket().GetSize()
 		}
 		if packetBytes > 0 {
-			bwMbpsFaceTotal = (estimatedBWFaceTotal * float64(packetBytes) * 8.0) / 1e6
+			bwMbpsFace = (estimatedBWFace * float64(packetBytes) * 8.0) / 1e6
 		}
+	}
+	sendMbpsMeasured := 0.0
+	if measuredSendPps > 0 {
+		packetBytes := dtDataPacketSizeBytes
+		if packetBytes <= 0 {
+			packetBytes = datapacket.NewDataPacket().GetSize()
+		}
+		if packetBytes > 0 {
+			sendMbpsMeasured = (measuredSendPps * float64(packetBytes) * 8.0) / 1e6
+		}
+	}
+	rateGapPps := newRate - measuredSendPps
+	sendLimit := dtSendLimitReason(newRate, measuredSendPps, pendingFace)
+	if starvationRounds >= dtLivenessStarvationLogThreshold {
+		core.Log.Warn(s, "DT scheduler starvation detected",
+			"face", upstreamFace,
+			"pendingFace", pendingFace,
+			"sendPpsMeasured", dtLogFloat1(measuredSendPps),
+			"rateNew", dtLogFloat1(newRate),
+			"sendLimit", sendLimit,
+			"starvationRounds", starvationRounds,
+			"livenessForcedPackets", livenessForcedPackets)
 	}
 
 	core.Log.Debug(s, "DT rate-control round",
 		"face", upstreamFace,
 		"prefixes", prefixes,
-		"signal", selectedSignal,
-		"interestQFaceAvg", interestQ,
-		"interestSlopeFaceAvg", interestSlope,
-		"dataQFaceAvg", dataQ,
-		"dataSlopeFaceAvg", dataSlope,
-		"q", currentQ,
-		"slope", queueSlope,
-		"bwPpsFaceTotal", estimatedBWFaceTotal,
-		"bwMbpsFaceTotal", bwMbpsFaceTotal,
-		"ratePrev", prevRate,
-		"rateNew", newRate,
+		"signalType", selectedSignal,
+		"signalQ", dtLogFloat1(currentQ),
+		"signalSlope", dtLogFloat1(queueSlope),
+		"signalInterestQ", dtLogFloat1(interestQ),
+		"signalInterestSlope", dtLogFloat1(interestSlope),
+		"signalDataQ", dtLogFloat1(dataQ),
+		"signalDataSlope", dtLogFloat1(dataSlope),
+		"bwPps", dtLogFloat1(estimatedBWFace),
+		"bwMbps", dtLogFloat1(bwMbpsFace),
+		"sendPps", dtLogFloat1(measuredSendPps),
+		"sendMbps", dtLogFloat1(sendMbpsMeasured),
+		"sendLimit", sendLimit,
+		"pendingFace", pendingFace,
+		"starvationRounds", starvationRounds,
+		"livenessForcedPackets", livenessForcedPackets,
+		"ratePrev", dtLogFloat1(prevRate),
+		"rateNew", dtLogFloat1(newRate),
+		"rateGapPps", dtLogFloat1(rateGapPps),
 		"action", dtRateActionString(finalAction))
+}
+
+// pendingDtInterestsForFace returns the number of queued DT interests (all threads, all prefixes)
+// that are currently eligible to be sent toward upstreamFace.
+func (s *Multipath) pendingDtInterestsForFace(upstreamFace uint64) int {
+	control := getDtFaceControlState(upstreamFace)
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	ensureDtControlThreadSlotsLocked(control)
+	total := 0
+	for _, demand := range control.demandByThread {
+		total += demand
+	}
+	return total
 }
 
 // ---- Helper Functions ----
@@ -1918,11 +2827,22 @@ func (s *Multipath) localNodeConverged(info *PathDiscoveryInfo) {
 			}
 			core.Log.Info(s, " - Tier", "index", i, "cost", cost, "faces", faces)
 		}
-		// ----------------------------------------
 
-		// TODO: Activate Data Transmission Scheduler
-		// TODO: Implement dt initialization logic later
-		// s.activateDTScheduler(info)
+		// Pre-activate per-face DT scheduler states as soon as PD converges.
+		seen := make(map[uint64]bool)
+		candidateFaces := make([]uint64, 0, 8)
+		for _, tier := range info.TierList {
+			for _, hop := range tier {
+				if !seen[hop.Nexthop] {
+					seen[hop.Nexthop] = true
+					candidateFaces = append(candidateFaces, hop.Nexthop)
+				}
+			}
+		}
+		if len(candidateFaces) > 0 {
+			s.ensureDtControlActivated(info.Prefix, candidateFaces, time.Now())
+		}
+		// ----------------------------------------
 
 		core.Log.Info(s, "Local Node Converged", "prefix", info.Prefix)
 	}

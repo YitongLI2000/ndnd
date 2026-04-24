@@ -29,6 +29,12 @@ type Face interface {
 
 	// GetSendQueueSize returns the transport send-queue occupancy metric.
 	GetSendQueueSize() uint64
+	// GetLinkSendQueueLen returns the number of packets queued in the link service.
+	GetLinkSendQueueLen() uint64
+	// GetLinkBacklogBytes returns cached egress link/qdisc backlog in bytes.
+	GetLinkBacklogBytes() uint64
+	// GetLinkBacklogPackets returns cached egress link/qdisc backlog in packets.
+	GetLinkBacklogPackets() uint64
 
 	SendPacket(out OutPkt)
 }

@@ -28,5 +28,5 @@ fw:
     websocket:
       enabled: false
   fw:
-    threads: 32
+    threads: 4
     strategy_node_name: core3

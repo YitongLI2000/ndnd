@@ -86,10 +86,11 @@ func MakeUnicastUDPTransport(
 	t.conn = conn.(*net.UDPConn)
 	t.running.Store(true)
 
-	if localURI == nil {
+	if localURI == nil || t.localAddr.IP == nil || t.localAddr.IP.IsUnspecified() {
 		t.localAddr = *t.conn.LocalAddr().(*net.UDPAddr)
 		t.localURI = defn.DecodeURIString("udp://" + t.localAddr.String())
 	}
+	t.linkBacklog = maybeStartQdiscBacklogSampler(t.localAddr.IP, t)
 
 	return t, nil
 }

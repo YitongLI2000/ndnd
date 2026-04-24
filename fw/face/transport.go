@@ -34,6 +34,9 @@ type transport interface {
 
 	// Get the number of queued outgoing packets
 	GetSendQueueSize() uint64
+	// Get cached egress link/qdisc backlog.
+	GetLinkBacklogBytes() uint64
+	GetLinkBacklogPackets() uint64
 	// Send a frame (make if copy if necessary)
 	sendFrame([]byte)
 	// Receive frames in an infinite loop
@@ -52,6 +55,7 @@ type transport interface {
 type transportBase struct {
 	linkService LinkService
 	running     atomic.Bool
+	linkBacklog *transportLinkBacklog
 
 	faceID         uint64
 	remoteURI      *defn.URI
@@ -65,6 +69,11 @@ type transportBase struct {
 	// Counters
 	nInBytes  uint64
 	nOutBytes uint64
+}
+
+type transportLinkBacklog struct {
+	bytes   atomic.Uint64
+	packets atomic.Uint64
 }
 
 // (AI GENERATED DESCRIPTION): Initializes a transportBase instance with the specified remote and local URIs, persistency, scope, link type, and MTU values, resetting its running flag to false.
@@ -169,4 +178,20 @@ func (t *transportBase) NInBytes() uint64 {
 // (AI GENERATED DESCRIPTION): Returns the total number of bytes that have been sent through this transport.
 func (t *transportBase) NOutBytes() uint64 {
 	return t.nOutBytes
+}
+
+// GetLinkBacklogBytes returns the latest cached egress qdisc backlog in bytes.
+func (t *transportBase) GetLinkBacklogBytes() uint64 {
+	if t.linkBacklog == nil {
+		return 0
+	}
+	return t.linkBacklog.bytes.Load()
+}
+
+// GetLinkBacklogPackets returns the latest cached egress qdisc backlog in packets.
+func (t *transportBase) GetLinkBacklogPackets() uint64 {
+	if t.linkBacklog == nil {
+		return 0
+	}
+	return t.linkBacklog.packets.Load()
 }

@@ -20,8 +20,8 @@ const (
 
 // DataPacket represents the structured data format for Data Transmission (DT)
 type DataPacket struct {
-	InterestQsf float64   // Interest QoS factor
-	DataQsf     float64   // Data QoS factor
+	InterestQsf float64   // Normalized Interest queue occupancy in [0, 1]
+	DataQsf     float64   // Normalized Data queue occupancy in [0, 1]
 	Values      []float64 // Vector of configurable length (DataPacketValueCount)
 }
 

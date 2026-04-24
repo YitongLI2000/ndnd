@@ -29,7 +29,7 @@ const (
 
 	// RTT & Retransmission Defaults (DT Only)
 	RTT_WINDOW_DURATION = 600 * time.Millisecond
-	MIN_RTO             = 80.0
+	MIN_RTO             = 120.0
 	MAX_RTO             = 800.0
 	// DT control-update period = DT_CONTROL_PERIOD_RTT_SCALE * avg bootstrap RTT.
 	DT_CONTROL_PERIOD_RTT_SCALE = 1.0
@@ -53,6 +53,63 @@ const (
 	RC_CAP_UPPER_MULT       = 1.75
 )
 
+type ConsumerRateControlMode int
+
+const (
+	ConsumerRateControlDelay ConsumerRateControlMode = iota
+	ConsumerRateControlQsf
+)
+
+type ConsumerQsfRateControlAction int
+
+const (
+	ConsumerQsfActionEmergencyDecrease ConsumerQsfRateControlAction = iota
+	ConsumerQsfActionHoldDraining
+	ConsumerQsfActionGentleDecrease
+	ConsumerQsfActionCautiousIncrease
+	ConsumerQsfActionAggressiveProbe
+	ConsumerQsfActionBWCapped
+	ConsumerQsfActionBWBoosted
+	ConsumerQsfActionGlobalMinCapped
+	ConsumerQsfActionGlobalMaxCapped
+)
+
+type ConsumerQsfRateControlParams struct {
+	MaxQueueSize      float64
+	QueueAlpha        float64
+	QueueBeta         float64
+	MDFactor          float64
+	RPFactor          float64
+	GDFactor          float64
+	CIFactor          float64
+	SlopeThreshold    float64
+	MaxBWSafetyRatio  float64
+	MinBWSafetyRatio  float64
+	MinRate           float64
+	MaxRate           float64
+	SlopeTauRatio     float64
+	NoSampleWarnEvery time.Duration
+}
+
+const consumerRateControlMode = ConsumerRateControlQsf
+
+var consumerQsfRateControlParams = ConsumerQsfRateControlParams{
+	MaxQueueSize:      1.0,
+	QueueAlpha:        0.5,
+	QueueBeta:         0.8,
+	MDFactor:          0.9,
+	RPFactor:          1.05,
+	GDFactor:          0.95,
+	CIFactor:          1.02,
+	SlopeThreshold:    0.1,
+	MaxBWSafetyRatio:  1.5,
+	MinBWSafetyRatio:  0.5,
+	MinRate:           0.005,
+	MaxRate:           0.0,
+	SlopeTauRatio:     1.0 / 3.0,
+	NoSampleWarnEvery: 500 * time.Millisecond,
+}
+
 // Historical hardcoded DT tuning (for DataPacketValueCount=150):
 // MAX_PACKETS = 15000
 // DT_INIT_RATE = 3000.0
@@ -61,7 +118,7 @@ const (
 const (
 	baseMaxPackets         = 15000
 	baseDTInitRate         = 3000.0
-	baseThroughputWindow   = 20 * time.Millisecond
+	baseThroughputWindow   = 30 * time.Millisecond
 	baseRCMinRate          = 10.0
 	baseDataPacketSizeByte = 16 + (150 * 8) // InterestQsf + DataQsf + 150 float64 values
 )
@@ -84,6 +141,10 @@ type ConsumerTag struct{}
 func (ConsumerTag) String() string { return "NDN-Consumer" }
 
 var consumerTag = ConsumerTag{}
+
+func consumerLogFloat1(v float64) float64 {
+	return math.Round(v*10) / 10
+}
 
 type TransmissionMode int
 
@@ -136,9 +197,10 @@ func applyAdaptiveDtTunables() {
 // --- Packet Structures ---
 
 type PacketSample struct {
-	Timestamp time.Time
-	Size      int
-	RTT       float64
+	Timestamp   time.Time
+	Size        int
+	RTT         float64
+	InterestQsf float64
 }
 
 type RTTSample struct {
@@ -184,12 +246,18 @@ type FlowContext struct {
 	srtt, rttVar          float64
 	window                []PacketSample
 	estimatedBandwidth    float64
+	lastMeasuredBandwidth float64
+	lastBWUpdateRule      string
+	lastRateSampleTime    time.Time
+	lastNoSampleWarn      time.Time
 	pktsCalibrated        int
 	initialRTTSum         float64
 	baseRTT               float64
 	adjustmentPeriod      time.Duration
 	lastRateUpdate        time.Time
 	interestsSentInPeriod int
+	retxQueue             []int
+	retxQueued            map[int]bool
 
 	// Reset signal for runFlow loop
 	resetSignal chan struct{}
@@ -204,6 +272,8 @@ func NewFlowContext(prefix string) *FlowContext {
 		endTime:      now,
 		doneCh:       make(chan struct{}),
 		pendingSends: make(map[string]PendingSend),
+		retxQueue:    make([]int, 0),
+		retxQueued:   make(map[int]bool),
 		resetSignal:  make(chan struct{}, 1),
 	}
 
@@ -230,14 +300,33 @@ func NewFlowContext(prefix string) *FlowContext {
 }
 
 func (f *FlowContext) initDTState() {
+	now := time.Now()
+
 	f.currentRate = DT_INIT_RATE
 	f.rto = MIN_RTO * 2
 
+	f.startTime = now
+	f.endTime = now
+	f.totalBytes = 0
+	f.pktsReceivedTotal = 0
+	f.isFinished = false
+	f.pendingSends = make(map[string]PendingSend)
+	f.retxQueue = make([]int, 0)
+	f.retxQueued = make(map[int]bool)
 	f.rttHistory = make([]RTTSample, 0)
 	f.estimatedBandwidth = DT_INIT_RATE
+	f.lastMeasuredBandwidth = 0
+	f.lastBWUpdateRule = "init"
+	f.lastRateSampleTime = time.Time{}
+	f.lastNoSampleWarn = time.Time{}
 	f.window = make([]PacketSample, 0)
 	f.pktsCalibrated = 0
-	f.lastRateUpdate = time.Now()
+	f.initialRTTSum = 0
+	f.baseRTT = 0
+	f.srtt = 0
+	f.rttVar = 0
+	f.interestsSentInPeriod = 0
+	f.lastRateUpdate = now
 
 	n, _ := enc.NameFromStr(f.Prefix)
 	if consumerNodeName != "" {
@@ -291,11 +380,68 @@ func (f *FlowContext) RecordInterestSend(name string, t time.Time, isRetransmiss
 	}
 
 	if f.Mode == ModeDT {
+		// Retransmissions are also token-controlled and consume link capacity, so
+		// include them in the measured send rate printed by the control loop.
 		f.interestsSentInPeriod++
-	} else {
+	} else if !isRetransmission {
 		f.OutstandingPD++
 	}
 	f.mu.Unlock()
+}
+
+func (f *FlowContext) QueueRetransmission(seq int) bool {
+	if seq <= 0 {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Mode != ModeDT || f.isFinished || f.retxQueued[seq] {
+		return false
+	}
+	f.retxQueued[seq] = true
+	f.retxQueue = append(f.retxQueue, seq)
+	return true
+}
+
+func (f *FlowContext) PopRetransmission() (int, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for len(f.retxQueue) > 0 {
+		seq := f.retxQueue[0]
+		copy(f.retxQueue[0:], f.retxQueue[1:])
+		f.retxQueue[len(f.retxQueue)-1] = 0
+		f.retxQueue = f.retxQueue[:len(f.retxQueue)-1]
+		if !f.retxQueued[seq] {
+			continue
+		}
+		delete(f.retxQueued, seq)
+		if f.Mode != ModeDT || f.isFinished {
+			continue
+		}
+		if _, pending := f.pendingSends[f.interestNameForSeq(seq)]; !pending {
+			continue
+		}
+		return seq, true
+	}
+	return 0, false
+}
+
+func (f *FlowContext) interestNameForSeq(seq int) string {
+	return f.baseName.Append(enc.NewStringComponent(0x08, "seq-"+strconv.Itoa(seq))).String()
+}
+
+func (f *FlowContext) ClearQueuedRetransmission(seq int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clearQueuedRetransmissionLocked(seq)
+}
+
+// THREAD SAFETY: caller must hold f.mu.
+func (f *FlowContext) clearQueuedRetransmissionLocked(seq int) {
+	if seq <= 0 {
+		return
+	}
+	delete(f.retxQueued, seq)
 }
 
 // --- Core Event Handlers ---
@@ -304,10 +450,6 @@ func (f *FlowContext) RecordInterestSend(name string, t time.Time, isRetransmiss
 func (f *FlowContext) OnNack(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	// TODO: added by yitong, nack pipeline
-	// Simple printf for debugging
-	fmt.Printf("[NACK DEBUG] Received NACK for: %s, Mode: %v, Prefix: %s\n", name, f.Mode, f.Prefix)
 
 	log.Debug(consumerTag, "OnNack", "name", name, "mode", f.Mode)
 
@@ -349,19 +491,20 @@ func (f *FlowContext) OnTimeout(name string) {
 	}
 }
 
-// OnData handles Data packets.
-func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.Time) {
+// OnData handles Data packets and returns true only when the Data completed a
+// currently pending Interest. Duplicate or stale Data should not inflate stats.
+func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.Time) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	pending, ok := f.pendingSends[dataName]
 	if !ok {
-		return
+		return false
 	}
 	delete(f.pendingSends, dataName)
 
 	if f.isFinished {
-		return
+		return false
 	}
 
 	// =========================================================
@@ -380,7 +523,7 @@ func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.T
 		discoveryPkt, err := datapacket.DeserializeDiscovery(payload)
 		if err != nil {
 			log.Warn(consumerTag, "PD: Failed to deserialize packet", "err", err)
-			return
+			return false
 		}
 
 		if discoveryPkt.NodeConverged && !f.StopPD {
@@ -402,17 +545,17 @@ func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.T
 		}
 
 		f.checkPdState()
-		return
+		return true
 	}
 
 	// =========================================================
 	//             MODE B: DATA TRANSMISSION (DT)
 	// =========================================================
 	if f.Mode == ModeDT {
-		_, err := datapacket.DeserializeData(payload)
+		dataPacket, err := datapacket.DeserializeData(payload)
 		if err != nil {
 			log.Warn(consumerTag, "DT: Failed to deserialize packet", "err", err)
-			return
+			return false
 		}
 
 		rttVal := float64(receiveTime.Sub(pending.SendTime).Nanoseconds()) / 1e6
@@ -427,17 +570,22 @@ func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.T
 		}
 
 		seqNum := extractSeqNum(dataName)
+		f.clearQueuedRetransmissionLocked(seqNum)
 		if seqNum >= 0 && seqNum%200 == 0 {
 			log.Debug(consumerTag, "DT Data Received", "name", dataName, "rtt", rttVal, "totalRx", f.pktsReceivedTotal)
 		}
 
 		// Karn's algorithm: do not update RTT/RTO estimator with ambiguous RTT samples
-		// from Interests that were retransmitted.
+		// from Interests that were retransmitted. Keep retransmitted Data out of
+		// rate control too, otherwise old send timestamps inflate RTT and collapse BW.
 		if !pending.Retransmitted {
 			f.updateRTT(receiveTime, rttVal)
+			f.updateRateControl(receiveTime, len(payload), rttVal, dataPacket.InterestQsf)
 		}
-		f.updateRateControl(receiveTime, len(payload), rttVal)
+		return true
 	}
+
+	return false
 }
 
 func (f *FlowContext) checkPdState() {
@@ -505,33 +653,33 @@ func (f *FlowContext) updateRTT(receiveTime time.Time, rttVal float64) {
 	f.rto = finalRTO
 }
 
-func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, rttVal float64) {
-	f.window = append(f.window, PacketSample{Timestamp: receiveTime, Size: payloadSize, RTT: rttVal})
-	cutoff := receiveTime.Add(-THROUGHPUT_WINDOW_DUR)
-	validWinIdx := 0
-	for i, s := range f.window {
-		if s.Timestamp.After(cutoff) {
-			validWinIdx = i
-			break
-		}
-	}
-	f.window = f.window[validWinIdx:]
+func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, rttVal float64, interestQsf float64) {
+	f.lastRateSampleTime = receiveTime
+	f.window = append(f.window, PacketSample{
+		Timestamp:   receiveTime,
+		Size:        payloadSize,
+		RTT:         rttVal,
+		InterestQsf: interestQsf,
+	})
+	f.trimRateControlWindow(receiveTime)
 
 	if f.pktsCalibrated < 5 {
 		f.initialRTTSum += rttVal
 		f.pktsCalibrated++
 		if f.pktsCalibrated == 5 {
 			f.baseRTT = f.initialRTTSum / 5.0
-			// Use scaled average bootstrap RTT as control-update period (in ms).
+			// Use scaled bootstrap RTT as the control-update period, but do not
+			// allow very small RTTs to make the application control loop too noisy.
 			f.adjustmentPeriod = time.Duration(f.baseRTT * DT_CONTROL_PERIOD_RTT_SCALE * float64(time.Millisecond))
-			if f.adjustmentPeriod < 20*time.Millisecond {
-				f.adjustmentPeriod = 20 * time.Millisecond
+			if f.adjustmentPeriod < 30*time.Millisecond {
+				f.adjustmentPeriod = 30 * time.Millisecond
 			}
 			f.lastRateUpdate = receiveTime
 			f.interestsSentInPeriod = 0
 			log.Info(consumerTag, "Flow Calibration Complete",
 				"flow", f.Prefix,
-				"baseRTT", f.baseRTT,
+				"mode", consumerRateControlModeString(),
+				"baseRTT", consumerLogFloat1(f.baseRTT),
 				"controlPeriodScale", DT_CONTROL_PERIOD_RTT_SCALE,
 				"adjustmentPeriod", f.adjustmentPeriod)
 		}
@@ -539,78 +687,349 @@ func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, 
 	}
 
 	timeSinceLastUpdate := receiveTime.Sub(f.lastRateUpdate)
-	if timeSinceLastUpdate >= f.adjustmentPeriod {
-		actualRate := 0.0
-		if timeSinceLastUpdate.Seconds() > 0 {
-			actualRate = float64(f.interestsSentInPeriod) / timeSinceLastUpdate.Seconds()
-		}
-
-		var totalWinRTT float64
-		var totalWinBytes int
-		wCount := len(f.window)
-		if wCount == 0 {
-			return
-		}
-		for _, s := range f.window {
-			totalWinRTT += s.RTT
-			totalWinBytes += s.Size
-		}
-		avgWinRTT := totalWinRTT / float64(wCount)
-		measuredPPS := float64(wCount) / THROUGHPUT_WINDOW_DUR.Seconds()
-
-		if measuredPPS > f.estimatedBandwidth {
-			f.estimatedBandwidth = measuredPPS
-		}
-		if avgWinRTT > RC_RTT_LOW_THRESH_MULT*f.baseRTT {
-			f.estimatedBandwidth = measuredPPS
-		}
-
-		targetRate := f.currentRate
-		if avgWinRTT < RC_RTT_LOW_THRESH_MULT*f.baseRTT {
-			targetRate = f.currentRate * RC_INC_FACTOR
-		} else if avgWinRTT >= RC_RTT_LOW_THRESH_MULT*f.baseRTT && avgWinRTT < RC_RTT_HIGH_THRESH_MULT*f.baseRTT {
-			targetRate = f.currentRate
-		} else {
-			targetRate = f.estimatedBandwidth * RC_DEC_FACTOR
-		}
-
-		lower := RC_CAP_LOWER_MULT * f.estimatedBandwidth
-		if lower < 1.0 {
-			lower = 1.0
-		}
-		upper := RC_CAP_UPPER_MULT * f.estimatedBandwidth
-		if upper < DT_INIT_RATE {
-			upper = DT_INIT_RATE
-		}
-
-		if targetRate < lower {
-			targetRate = lower
-		}
-		if targetRate > upper {
-			targetRate = upper
-		}
-		if targetRate < RC_MIN_RATE {
-			targetRate = RC_MIN_RATE
-		}
-
-		oldRate := f.currentRate
-		f.currentRate = targetRate
-		f.lastRateUpdate = receiveTime
-		avgPayloadBytes := float64(totalWinBytes) / float64(wCount)
-		estimatedBWMbps := (f.estimatedBandwidth * avgPayloadBytes * 8.0) / 1e6
-
-		log.Debug(consumerTag, "Rate Adjusted",
-			"prefix", f.Prefix,
-			"oldTargetRate", oldRate,
-			"newTargetRate", f.currentRate,
-			"actualRate", actualRate,
-			"estimatedBW", f.estimatedBandwidth,
-			"estimatedBWMbps", estimatedBWMbps,
-			"baseRTT", f.baseRTT,
-			"latestRTT", avgWinRTT)
-
-		f.interestsSentInPeriod = 0
+	if timeSinceLastUpdate < f.adjustmentPeriod {
+		return
 	}
+
+	actualRate := 0.0
+	if timeSinceLastUpdate.Seconds() > 0 {
+		actualRate = float64(f.interestsSentInPeriod) / timeSinceLastUpdate.Seconds()
+	}
+
+	switch consumerRateControlMode {
+	case ConsumerRateControlQsf:
+		f.updateQsfRateControl(receiveTime, actualRate)
+	default:
+		f.updateDelayRateControl(receiveTime, actualRate)
+	}
+
+	f.interestsSentInPeriod = 0
+}
+
+func (f *FlowContext) trimRateControlWindow(now time.Time) {
+	cutoff := now.Add(-THROUGHPUT_WINDOW_DUR)
+	validWinIdx := len(f.window)
+	for i, s := range f.window {
+		if !s.Timestamp.Before(cutoff) {
+			validWinIdx = i
+			break
+		}
+	}
+	if validWinIdx > 0 {
+		f.window = f.window[validWinIdx:]
+	}
+}
+
+func consumerRateControlModeString() string {
+	switch consumerRateControlMode {
+	case ConsumerRateControlQsf:
+		return "qsf"
+	default:
+		return "delay"
+	}
+}
+
+func consumerQsfActionString(action ConsumerQsfRateControlAction) string {
+	switch action {
+	case ConsumerQsfActionEmergencyDecrease:
+		return "emergency-decrease"
+	case ConsumerQsfActionHoldDraining:
+		return "hold-draining"
+	case ConsumerQsfActionGentleDecrease:
+		return "gentle-decrease"
+	case ConsumerQsfActionCautiousIncrease:
+		return "cautious-increase"
+	case ConsumerQsfActionAggressiveProbe:
+		return "aggressive-probe"
+	case ConsumerQsfActionBWCapped:
+		return "bw-capped"
+	case ConsumerQsfActionBWBoosted:
+		return "bw-boosted"
+	case ConsumerQsfActionGlobalMinCapped:
+		return "global-min-capped"
+	case ConsumerQsfActionGlobalMaxCapped:
+		return "global-max-capped"
+	default:
+		return "unknown"
+	}
+}
+
+func (f *FlowContext) checkRateControlNoFreshSamples(now time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.Mode != ModeDT || f.pktsCalibrated < 5 || f.isFinished {
+		return
+	}
+
+	f.trimRateControlWindow(now)
+	if len(f.window) > 0 || f.estimatedBandwidth <= 0 {
+		return
+	}
+
+	warnEvery := consumerQsfRateControlParams.NoSampleWarnEvery
+	if warnEvery <= 0 {
+		warnEvery = 500 * time.Millisecond
+	}
+	if !f.lastNoSampleWarn.IsZero() && now.Sub(f.lastNoSampleWarn) < warnEvery {
+		return
+	}
+
+	staleFor := time.Duration(0)
+	if !f.lastRateSampleTime.IsZero() {
+		staleFor = now.Sub(f.lastRateSampleTime)
+	}
+	lastRule := f.lastBWUpdateRule
+	f.lastNoSampleWarn = now
+	log.Warn(consumerTag, "DT BW estimate retained without fresh samples",
+		"prefix", f.Prefix,
+		"retainedBWPps", consumerLogFloat1(f.estimatedBandwidth),
+		"lastMeasuredBWPps", consumerLogFloat1(f.lastMeasuredBandwidth),
+		"lastUpdateRule", lastRule,
+		"staleFor", staleFor)
+}
+
+func (f *FlowContext) windowPayloadAvgBytes() float64 {
+	if len(f.window) == 0 {
+		return 0
+	}
+	totalBytes := 0
+	for _, s := range f.window {
+		totalBytes += s.Size
+	}
+	return float64(totalBytes) / float64(len(f.window))
+}
+
+func (f *FlowContext) measuredPPSFromWindow() float64 {
+	if len(f.window) == 0 || THROUGHPUT_WINDOW_DUR <= 0 {
+		return 0
+	}
+	return float64(len(f.window)) / THROUGHPUT_WINDOW_DUR.Seconds()
+}
+
+func (f *FlowContext) updateDelayRateControl(receiveTime time.Time, actualRate float64) {
+	var totalWinRTT float64
+	for _, s := range f.window {
+		totalWinRTT += s.RTT
+	}
+	avgWinRTT := totalWinRTT / float64(len(f.window))
+	measuredPPS := f.measuredPPSFromWindow()
+
+	bwUpdateRule := "retain"
+	if measuredPPS > f.estimatedBandwidth {
+		f.estimatedBandwidth = measuredPPS
+		bwUpdateRule = "throughput-high"
+	}
+	if avgWinRTT > RC_RTT_LOW_THRESH_MULT*f.baseRTT {
+		f.estimatedBandwidth = measuredPPS
+		bwUpdateRule = "rtt-pressure"
+	}
+	f.lastMeasuredBandwidth = measuredPPS
+	f.lastBWUpdateRule = bwUpdateRule
+
+	targetRate := f.currentRate
+	if avgWinRTT < RC_RTT_LOW_THRESH_MULT*f.baseRTT {
+		targetRate = f.currentRate * RC_INC_FACTOR
+	} else if avgWinRTT >= RC_RTT_HIGH_THRESH_MULT*f.baseRTT {
+		targetRate = f.estimatedBandwidth * RC_DEC_FACTOR
+	}
+
+	lower := RC_CAP_LOWER_MULT * f.estimatedBandwidth
+	if lower < 1.0 {
+		lower = 1.0
+	}
+	upper := RC_CAP_UPPER_MULT * f.estimatedBandwidth
+	if upper < DT_INIT_RATE {
+		upper = DT_INIT_RATE
+	}
+
+	if targetRate < lower {
+		targetRate = lower
+	}
+	if targetRate > upper {
+		targetRate = upper
+	}
+	if targetRate < RC_MIN_RATE {
+		targetRate = RC_MIN_RATE
+	}
+
+	oldRate := f.currentRate
+	f.currentRate = targetRate
+	f.lastRateUpdate = receiveTime
+	avgPayloadBytes := f.windowPayloadAvgBytes()
+	estimatedBWMbps := (f.estimatedBandwidth * avgPayloadBytes * 8.0) / 1e6
+
+	log.Debug(consumerTag, "Rate Adjusted",
+		"mode", "delay",
+		"prefix", f.Prefix,
+		"oldTargetRate", consumerLogFloat1(oldRate),
+		"newTargetRate", consumerLogFloat1(f.currentRate),
+		"actualRate", consumerLogFloat1(actualRate),
+		"measuredPPS", consumerLogFloat1(measuredPPS),
+		"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
+		"estimatedBWMbps", consumerLogFloat1(estimatedBWMbps),
+		"bwUpdateRule", bwUpdateRule,
+		"baseRTT", consumerLogFloat1(f.baseRTT),
+		"latestRTT", consumerLogFloat1(avgWinRTT))
+}
+
+func (f *FlowContext) updateQsfRateControl(receiveTime time.Time, actualRate float64) {
+	params := consumerQsfRateControlParams
+	currentQ, queueSlope := f.computeInterestQsfSignal(receiveTime)
+	measuredPPS := f.measuredPPSFromWindow()
+	bwUpdateRule := f.updateQsfBandwidthEstimate(measuredPPS, currentQ)
+
+	minRate := math.Max(params.MinRate, RC_MIN_RATE)
+	currentRate := f.currentRate
+	if currentRate <= 0 {
+		currentRate = minRate
+	}
+
+	qthHigh := params.MaxQueueSize * params.QueueBeta
+	qthLow := params.MaxQueueSize * params.QueueAlpha
+	targetRate := currentRate
+	action := ConsumerQsfActionHoldDraining
+
+	if currentQ >= qthHigh {
+		if queueSlope > params.SlopeThreshold {
+			targetRate = currentRate * params.MDFactor
+			action = ConsumerQsfActionEmergencyDecrease
+		} else if queueSlope < -params.SlopeThreshold {
+			targetRate = currentRate
+			action = ConsumerQsfActionHoldDraining
+		} else {
+			targetRate = currentRate * params.GDFactor
+			action = ConsumerQsfActionGentleDecrease
+		}
+	} else if currentQ >= qthLow {
+		targetRate = currentRate
+		action = ConsumerQsfActionHoldDraining
+	} else {
+		if queueSlope > params.SlopeThreshold {
+			if f.estimatedBandwidth > 0 {
+				targetRate = f.estimatedBandwidth * params.CIFactor
+			} else {
+				targetRate = currentRate * params.CIFactor
+			}
+			action = ConsumerQsfActionCautiousIncrease
+		} else {
+			if f.estimatedBandwidth > 0 {
+				targetRate = f.estimatedBandwidth * params.RPFactor
+			} else {
+				targetRate = currentRate * params.RPFactor
+			}
+			action = ConsumerQsfActionAggressiveProbe
+		}
+	}
+
+	if f.estimatedBandwidth > 0 {
+		upper := f.estimatedBandwidth * params.MaxBWSafetyRatio
+		if upper > 0 && targetRate > upper {
+			targetRate = upper
+			action = ConsumerQsfActionBWCapped
+		}
+
+		lower := f.estimatedBandwidth * params.MinBWSafetyRatio
+		if lower > 0 && targetRate < lower {
+			targetRate = lower
+			action = ConsumerQsfActionBWBoosted
+		}
+	}
+
+	if targetRate < minRate {
+		targetRate = minRate
+		action = ConsumerQsfActionGlobalMinCapped
+	}
+	if params.MaxRate > 0 && targetRate > params.MaxRate {
+		targetRate = params.MaxRate
+		action = ConsumerQsfActionGlobalMaxCapped
+	}
+
+	oldRate := f.currentRate
+	f.currentRate = targetRate
+	f.lastRateUpdate = receiveTime
+	avgPayloadBytes := f.windowPayloadAvgBytes()
+	estimatedBWMbps := (f.estimatedBandwidth * avgPayloadBytes * 8.0) / 1e6
+
+	log.Debug(consumerTag, "Rate Adjusted",
+		"mode", "qsf",
+		"prefix", f.Prefix,
+		"qsfAvg", consumerLogFloat1(currentQ),
+		"qsfSlope", consumerLogFloat1(queueSlope),
+		"oldTargetRate", consumerLogFloat1(oldRate),
+		"newTargetRate", consumerLogFloat1(f.currentRate),
+		"actualRate", consumerLogFloat1(actualRate),
+		"measuredPPS", consumerLogFloat1(measuredPPS),
+		"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
+		"estimatedBWMbps", consumerLogFloat1(estimatedBWMbps),
+		"bwUpdateRule", bwUpdateRule,
+		"action", consumerQsfActionString(action))
+}
+
+func (f *FlowContext) computeInterestQsfSignal(now time.Time) (float64, float64) {
+	if len(f.window) == 0 {
+		return 0, 0
+	}
+
+	tau := THROUGHPUT_WINDOW_DUR.Seconds() * consumerQsfRateControlParams.SlopeTauRatio
+	if tau <= 0 {
+		tau = THROUGHPUT_WINDOW_DUR.Seconds() / 3.0
+	}
+
+	var avgQsf float64
+	var sumW, sumWT, sumWQ, sumWTT, sumWTQ float64
+	for _, sample := range f.window {
+		qsf := sample.InterestQsf
+		avgQsf += qsf
+
+		t := sample.Timestamp.Sub(now).Seconds()
+		w := math.Exp(t / tau)
+		sumW += w
+		sumWT += w * t
+		sumWQ += w * qsf
+		sumWTT += w * t * t
+		sumWTQ += w * t * qsf
+	}
+	avgQsf /= float64(len(f.window))
+
+	denom := sumW*sumWTT - sumWT*sumWT
+	if math.Abs(denom) < 1e-9 {
+		return avgQsf, 0
+	}
+	slope := (sumW*sumWTQ - sumWT*sumWQ) / denom
+	return avgQsf, slope
+}
+
+func (f *FlowContext) updateQsfBandwidthEstimate(measuredPPS float64, queuePressureQsf float64) string {
+	prevBW := f.estimatedBandwidth
+	queueThreshold := consumerQsfRateControlParams.MaxQueueSize * consumerQsfRateControlParams.QueueAlpha
+	rule := "retain"
+
+	switch {
+	case measuredPPS <= 0 && prevBW > 0:
+		rule = "no-sample-retain"
+	case prevBW <= 0:
+		f.estimatedBandwidth = measuredPPS
+		rule = "bootstrap"
+	case measuredPPS > prevBW:
+		f.estimatedBandwidth = measuredPPS
+		rule = "new-throughput-high"
+	case queuePressureQsf > queueThreshold:
+		f.estimatedBandwidth = measuredPPS
+		rule = "queue-pressure"
+	default:
+		f.estimatedBandwidth = prevBW
+	}
+
+	if measuredPPS <= 0 {
+		f.lastMeasuredBandwidth = measuredPPS
+		f.lastBWUpdateRule = rule
+		return rule
+	}
+
+	f.lastMeasuredBandwidth = measuredPPS
+	f.lastBWUpdateRule = rule
+	return rule
 }
 
 func (f *FlowContext) GetFinalStats() (float64, int64, float64) {
@@ -788,20 +1207,11 @@ func (rc *RetransmissionController) StartScheduler() {
 
 					// --- DT MODE: Retransmit ---
 					if item.FlowCtx.Mode == ModeDT {
-						log.Debug(consumerTag, "DT: RTO Expired - Retransmitting", "name", item.Name)
-
-						// Double RTO (Backoff) or just use current RTO?
-						// Simple implementation: Use current updated RTO from flow
-						rto := item.FlowCtx.GetRTO()
-						item.Expiration = now.Add(time.Duration(rto) * time.Millisecond)
-
-						// Re-queue
-						heap.Push(&rc.pq, item)
+						queued := item.FlowCtx.QueueRetransmission(item.SequenceNum)
+						log.Debug(consumerTag, "DT: RTO Expired - Queueing retransmission",
+							"name", item.Name,
+							"queued", queued)
 						rc.mu.Unlock()
-
-						rc.stats.IncrementRetx()
-						// Trigger retransmission
-						go sendSingleInterest(rc.app, rc.stats, item.SequenceNum, item.FlowCtx, true)
 						continue
 					} else {
 						// --- PD MODE: Handle Timeout Logic (No Retransmit) ---
@@ -858,6 +1268,8 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 
 	if !isRetransmission {
 		stats.IncrementSent()
+	} else {
+		stats.IncrementRetx()
 	}
 	interestName := interest.FinalName.String()
 	sendTime := time.Now()
@@ -873,18 +1285,9 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 	// Update pending sends map (needed for RTT calc in DT)
 	flowCtx.RecordInterestSend(interestName, sendTime, isRetransmission)
 
-	// Add to Controller (if it's a retx, the controller already popped it, so we add it back/update it via Add)
-	// Note: In StartScheduler for DT, we pushed it back to heap. But here we might be adding a duplicate if we aren't careful.
-	// However, StartScheduler logic for DT pushes *item* back.
-	// If we call Add() here, we create a *new* item.
-	// Correction: StartScheduler pushes the *existing* item back to wait for the *next* RTO.
-	// We do NOT need to call Add() again if StartScheduler already re-queued it.
-	// BUT: StartScheduler calls sendSingleInterest with isRetransmission=true.
-	// If we don't call Add(), the map `active` is fine (it wasn't removed).
-	// So: Only call Add if NOT retransmission.
-	if !isRetransmission {
-		globalRetxController.Add(interestName, flowCtx.Prefix, sequenceNum, flowCtx)
-	}
+	// Arm the next application RTO from the actual send time. This matters for
+	// rate-controlled retransmissions because they may wait in retxQueue.
+	globalRetxController.Add(interestName, flowCtx.Prefix, sequenceNum, flowCtx)
 
 	err = app.Express(interest,
 		func(args ndn.ExpressCallbackArgs) {
@@ -893,6 +1296,7 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 			case ndn.InterestResultNack:
 				stats.IncrementNack()
 				globalRetxController.Remove(interestName)
+				flowCtx.ClearQueuedRetransmission(sequenceNum)
 				flowCtx.OnNack(interestName)
 
 			case ndn.InterestResultTimeout:
@@ -902,11 +1306,13 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 				log.Debug(consumerTag, "NDN Framework Timeout (Lifetime reached)", "name", interestName)
 				// We should ensure the controller stops tracking this if it hasn't already.
 				globalRetxController.Remove(interestName)
+				flowCtx.ClearQueuedRetransmission(sequenceNum)
 				// We do NOT call flowCtx.OnTimeout here, because the Controller likely already did
 				// (or will do) the RTO logic.
 
 			case ndn.InterestCancelled:
 				globalRetxController.Remove(interestName)
+				flowCtx.ClearQueuedRetransmission(sequenceNum)
 
 			case ndn.InterestResultData:
 				data := args.Data
@@ -920,8 +1326,9 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 						"interestName", interestName, "dataName", dataName)
 					globalRetxController.Remove(dataName)
 				}
-				stats.IncrementData()
-				flowCtx.OnData(content, interestName, receiveTime)
+				if flowCtx.OnData(content, interestName, receiveTime) {
+					stats.IncrementData()
+				}
 			}
 		})
 }
@@ -952,6 +1359,8 @@ func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.W
 			sequenceNum = 0
 
 		case <-ticker.C:
+			flowCtx.checkRateControlNoFreshSamples(time.Now())
+
 			// PD Logic: Pause Check
 			if flowCtx.Mode == ModePD {
 				flowCtx.mu.Lock()
@@ -979,6 +1388,14 @@ func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.W
 			tokens += currentRate * TICKER_INTERVAL.Seconds()
 
 			for tokens >= 1.0 {
+				if flowCtx.Mode == ModeDT {
+					if retxSeq, ok := flowCtx.PopRetransmission(); ok {
+						tokens -= 1.0
+						sendSingleInterest(app, stats, retxSeq, flowCtx, true)
+						continue
+					}
+				}
+
 				if sequenceNum >= MAX_PACKETS {
 					tokens = 0
 					if flowCtx.Mode == ModePD {

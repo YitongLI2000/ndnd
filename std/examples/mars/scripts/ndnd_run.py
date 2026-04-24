@@ -72,7 +72,7 @@ FW_TYPE_PARAMS = {
         'tcp_enabled': True,
         'tcp_port_unicast': 6363,
         'websocket_enabled': False,
-        'threads': 32,
+        'threads': 4,
     },
     'core': {
         'core_log_level': "INFO",
@@ -82,7 +82,7 @@ FW_TYPE_PARAMS = {
         'tcp_enabled': True,
         'tcp_port_unicast': 6363,
         'websocket_enabled': False,
-        'threads': 32,
+        'threads': 4,
     },
     'edge': {
         'core_log_level': "INFO",
@@ -92,17 +92,17 @@ FW_TYPE_PARAMS = {
         'tcp_enabled': True,
         'tcp_port_unicast': 6363,
         'websocket_enabled': False,
-        'threads': 32,
+        'threads': 4,
     },
     'pro': {
-        'core_log_level': "INFO",
+        'core_log_level': "DEBUG",
         'udp_enabled_unicast': True,
         'udp_enabled_multicast': False,
         'udp_port_unicast': 6363,
         'tcp_enabled': True,
         'tcp_port_unicast': 6363,
         'websocket_enabled': False,
-        'threads': 32,
+        'threads': 4,
     },
 }
 

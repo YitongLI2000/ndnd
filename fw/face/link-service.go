@@ -38,6 +38,9 @@ type LinkService interface {
 	ExpirationPeriod() time.Duration
 	State() defn.State
 	GetSendQueueSize() uint64
+	GetLinkSendQueueLen() uint64
+	GetLinkBacklogBytes() uint64
+	GetLinkBacklogPackets() uint64
 
 	// Run is the main entry point for running face thread
 	// initial is optional new incoming frame
@@ -176,6 +179,27 @@ func (l *linkServiceBase) GetSendQueueSize() uint64 {
 	return l.transport.GetSendQueueSize()
 }
 
+// GetLinkSendQueueLen returns the number of packets waiting in the link-service send queue.
+func (l *linkServiceBase) GetLinkSendQueueLen() uint64 {
+	return uint64(len(l.sendQueue))
+}
+
+// GetLinkBacklogBytes returns cached egress link/qdisc backlog in bytes.
+func (l *linkServiceBase) GetLinkBacklogBytes() uint64 {
+	if l.transport == nil {
+		return 0
+	}
+	return l.transport.GetLinkBacklogBytes()
+}
+
+// GetLinkBacklogPackets returns cached egress link/qdisc backlog in packets.
+func (l *linkServiceBase) GetLinkBacklogPackets() uint64 {
+	if l.transport == nil {
+		return 0
+	}
+	return l.transport.GetLinkBacklogPackets()
+}
+
 //
 // Counters
 //
@@ -242,7 +266,6 @@ func (l *linkServiceBase) dispatchInterest(pkt *defn.Pkt) {
 	// Store name for easy access
 	pkt.Name = pkt.L3.Interest.NameV
 
-	// Hash name to thread
 	thread := fw.HashNameToFwThread(pkt.Name)
 	core.Log.Trace(l, "Dispatched Interest", "thread", thread)
 	dispatch.GetFWThread(thread).QueueInterest(pkt)
