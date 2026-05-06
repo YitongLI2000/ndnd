@@ -65,14 +65,14 @@ DV_TYPE_PARAMS = {
 # One editable parameter block per node type.
 FW_TYPE_PARAMS = {
     'con': {
-        'core_log_level': "DEBUG",
+        'core_log_level': "INFO",
         'udp_enabled_unicast': True,
         'udp_enabled_multicast': False,
         'udp_port_unicast': 6363,
         'tcp_enabled': True,
         'tcp_port_unicast': 6363,
         'websocket_enabled': False,
-        'threads': 4,
+        'threads': 2,
     },
     'core': {
         'core_log_level': "INFO",
@@ -82,7 +82,7 @@ FW_TYPE_PARAMS = {
         'tcp_enabled': True,
         'tcp_port_unicast': 6363,
         'websocket_enabled': False,
-        'threads': 4,
+        'threads': 2,
     },
     'edge': {
         'core_log_level': "INFO",
@@ -92,17 +92,17 @@ FW_TYPE_PARAMS = {
         'tcp_enabled': True,
         'tcp_port_unicast': 6363,
         'websocket_enabled': False,
-        'threads': 4,
+        'threads': 2,
     },
     'pro': {
-        'core_log_level': "DEBUG",
+        'core_log_level': "INFO",
         'udp_enabled_unicast': True,
         'udp_enabled_multicast': False,
         'udp_port_unicast': 6363,
         'tcp_enabled': True,
         'tcp_port_unicast': 6363,
         'websocket_enabled': False,
-        'threads': 4,
+        'threads': 2,
     },
 }
 

@@ -2,9 +2,11 @@ package main
 
 import (
 	"container/heap"
+	"encoding/csv"
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,14 +33,22 @@ const (
 	RTT_WINDOW_DURATION = 600 * time.Millisecond
 	MIN_RTO             = 120.0
 	MAX_RTO             = 800.0
+	// Static DT control period used as the BW-estimator cadence reference.
+	DT_STATIC_CONTROL_PERIOD = 20 * time.Millisecond
+	// Set to true to force a fixed consumer DT control period. When false, the
+	// control period is derived from RTT bootstrap and clamped to at least the
+	// static period.
+	DT_USE_STATIC_CONTROL_PERIOD = true
 	// DT control-update period = DT_CONTROL_PERIOD_RTT_SCALE * avg bootstrap RTT.
 	DT_CONTROL_PERIOD_RTT_SCALE = 1.0
+	// Enable startup InterestQsf bias learning/removal on the consumer.
+	DT_USE_QSF_BIAS_REMOVAL = false //! This feature should be tested
 )
 
 // --- Path Discovery (PD) Configuration ---
 const (
 	// Max pd rate is 20000 interests/sec
-	PD_INIT_RATE        = 2000.0
+	PD_INIT_RATE        = 1000.0
 	PD_INIT_RTO         = 200.0
 	PD_REHEARSAL_BUDGET = 20
 )
@@ -102,7 +112,7 @@ var consumerQsfRateControlParams = ConsumerQsfRateControlParams{
 	GDFactor:          0.95,
 	CIFactor:          1.02,
 	SlopeThreshold:    0.1,
-	MaxBWSafetyRatio:  1.5,
+	MaxBWSafetyRatio:  1.2,
 	MinBWSafetyRatio:  0.5,
 	MinRate:           0.005,
 	MaxRate:           0.0,
@@ -118,10 +128,19 @@ var consumerQsfRateControlParams = ConsumerQsfRateControlParams{
 const (
 	baseMaxPackets         = 15000
 	baseDTInitRate         = 3000.0
-	baseThroughputWindow   = 30 * time.Millisecond
+	baseThroughputWindow   = 20 * time.Millisecond //! Sliding window duration
 	baseRCMinRate          = 10.0
 	baseDataPacketSizeByte = 16 + (150 * 8) // InterestQsf + DataQsf + 150 float64 values
+	consumerQsfSampleLimit = 3
+	consumerBwSampleMin    = 2
+	//! Bw estimation
+	consumerBwObsLimit   = 3
+	consumerBwAlphaUp    = 0.25
+	consumerBwAlphaDown  = 0.25
+	consumerBwAlphaSmall = 0.10
 )
+
+const consumerStatsCsvDir = "std/examples/mars/logs"
 
 var (
 	MAX_PACKETS           = baseMaxPackets
@@ -158,6 +177,8 @@ var (
 	initialMode      = ModePD
 	consumerNodeName string
 	consumerIndex    int
+	consumerCsvStart time.Time
+	consumerCsvMu    sync.Mutex
 
 	// Global Synchronization for PD -> DT transition
 	pdFinishedCount int
@@ -201,7 +222,17 @@ type PacketSample struct {
 	Size        int
 	RTT         float64
 	InterestQsf float64
+	DataQsf     float64
 }
+
+type bwTrend int
+
+const (
+	bwTrendUnknown bwTrend = iota
+	bwTrendIncreasing
+	bwTrendDecreasing
+	bwTrendFluctuating
+)
 
 type RTTSample struct {
 	Timestamp time.Time
@@ -211,6 +242,14 @@ type RTTSample struct {
 type PendingSend struct {
 	SendTime      time.Time
 	Retransmitted bool
+}
+
+type flowCsvSink struct {
+	mu            sync.Mutex
+	path          string
+	file          *os.File
+	writer        *csv.Writer
+	headerWritten bool
 }
 
 type FlowContext struct {
@@ -248,6 +287,21 @@ type FlowContext struct {
 	estimatedBandwidth    float64
 	lastMeasuredBandwidth float64
 	lastBWUpdateRule      string
+	lastInterestQsfAvg    float64
+	lastInterestQsfSlope  float64
+	lastDataQsfAvg        float64
+	lastDataQsfSlope      float64
+	lastQsfObservationOk  bool
+	qsfWindowWarmed       bool
+	interestQsfBias       float64
+	interestQsfBiasSum    float64
+	interestQsfBiasCount  int
+	interestQsfBiasReady  bool
+	bwCapActive           bool
+	bwCapEligible         bool
+	bwBootstrapReady      bool
+	bwObservations        []float64
+	lastBwObservationTime time.Time
 	lastRateSampleTime    time.Time
 	lastNoSampleWarn      time.Time
 	pktsCalibrated        int
@@ -257,10 +311,19 @@ type FlowContext struct {
 	lastRateUpdate        time.Time
 	interestsSentInPeriod int
 	retxQueue             []int
+	retxHead              int
 	retxQueued            map[int]bool
+	firstDtDataLogged     bool
+	lastCsvPayloadBytes   float64
+	lastCsvBWMbps         float64
+	lastCsvPrevRateMbps   float64
+	lastCsvActualRateMbps float64
+	lastCsvNewRateMbps    float64
+	lastCsvMetricsValid   bool
 
 	// Reset signal for runFlow loop
 	resetSignal chan struct{}
+	csvSink     *flowCsvSink
 }
 
 func NewFlowContext(prefix string) *FlowContext {
@@ -273,6 +336,7 @@ func NewFlowContext(prefix string) *FlowContext {
 		doneCh:       make(chan struct{}),
 		pendingSends: make(map[string]PendingSend),
 		retxQueue:    make([]int, 0),
+		retxHead:     0,
 		retxQueued:   make(map[int]bool),
 		resetSignal:  make(chan struct{}, 1),
 	}
@@ -312,11 +376,28 @@ func (f *FlowContext) initDTState() {
 	f.isFinished = false
 	f.pendingSends = make(map[string]PendingSend)
 	f.retxQueue = make([]int, 0)
+	f.retxHead = 0
 	f.retxQueued = make(map[int]bool)
+	f.firstDtDataLogged = false
 	f.rttHistory = make([]RTTSample, 0)
 	f.estimatedBandwidth = DT_INIT_RATE
 	f.lastMeasuredBandwidth = 0
 	f.lastBWUpdateRule = "init"
+	f.lastInterestQsfAvg = 0
+	f.lastInterestQsfSlope = 0
+	f.lastDataQsfAvg = 0
+	f.lastDataQsfSlope = 0
+	f.lastQsfObservationOk = false
+	f.qsfWindowWarmed = false
+	f.interestQsfBias = 0
+	f.interestQsfBiasSum = 0
+	f.interestQsfBiasCount = 0
+	f.interestQsfBiasReady = false
+	f.bwCapActive = false
+	f.bwCapEligible = false
+	f.bwBootstrapReady = false
+	f.bwObservations = make([]float64, 0, consumerBwObsLimit)
+	f.lastBwObservationTime = time.Time{}
 	f.lastRateSampleTime = time.Time{}
 	f.lastNoSampleWarn = time.Time{}
 	f.window = make([]PacketSample, 0)
@@ -334,6 +415,148 @@ func (f *FlowContext) initDTState() {
 	}
 	n = n.Append(enc.NewStringComponent(0x08, "dt"))
 	f.baseName = n
+}
+
+func flowPrefixCsvLabel(prefix string) string {
+	label := strings.TrimPrefix(prefix, "/")
+	label = strings.ReplaceAll(label, "/", "_")
+	if label == "" {
+		return "unknown"
+	}
+	return label
+}
+
+func (f *FlowContext) getFlowCsvSink() *flowCsvSink {
+	if consumerNodeName == "" {
+		return nil
+	}
+	if f.csvSink != nil {
+		return f.csvSink
+	}
+	f.csvSink = &flowCsvSink{
+		path: filepath.Join(consumerStatsCsvDir, consumerNodeName+"_"+flowPrefixCsvLabel(f.Prefix)+".csv"),
+	}
+	return f.csvSink
+}
+
+func consumerCsvFloat(v float64) string {
+	return strconv.FormatFloat(v, 'f', 6, 64)
+}
+
+func consumerElapsedMs(now time.Time) float64 {
+	consumerCsvMu.Lock()
+	defer consumerCsvMu.Unlock()
+	if consumerCsvStart.IsZero() {
+		consumerCsvStart = now
+	}
+	return now.Sub(consumerCsvStart).Seconds() * 1000.0
+}
+
+func ratePpsToMbps(ratePps float64, payloadBytes float64) float64 {
+	if ratePps <= 0 || payloadBytes <= 0 {
+		return 0
+	}
+	return (ratePps * payloadBytes * 8.0) / 1e6
+}
+
+func (f *FlowContext) writeRateControlCsv(
+	now time.Time,
+	interestQ float64,
+	interestSlope float64,
+	dataQ float64,
+	bwPps float64,
+	bwSamples int,
+	prevRate float64,
+	actualRate float64,
+	newRate float64,
+	controlState string,
+) {
+	sink := f.getFlowCsvSink()
+	if sink == nil {
+		return
+	}
+
+	elapsedMs := consumerElapsedMs(now)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+
+	if sink.writer == nil {
+		if err := os.MkdirAll(filepath.Dir(sink.path), 0o755); err != nil {
+			log.Warn(consumerTag, "Failed to create consumer CSV directory", "path", sink.path, "err", err)
+			return
+		}
+		file, err := os.OpenFile(sink.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			log.Warn(consumerTag, "Failed to open consumer CSV", "path", sink.path, "err", err)
+			return
+		}
+		sink.file = file
+		sink.writer = csv.NewWriter(file)
+	}
+
+	if !sink.headerWritten {
+		header := []string{
+			"time_ms",
+			"interest_q",
+			"interest_slope",
+			"data_q",
+			"bw_est_mbps",
+			"bw_samples",
+			"send_prev_mbps",
+			"send_actual_prev_mbps",
+			"send_new_mbps",
+			"control_state",
+		}
+		if err := sink.writer.Write(header); err != nil {
+			log.Warn(consumerTag, "Failed to write consumer CSV header", "path", sink.path, "err", err)
+			return
+		}
+		sink.headerWritten = true
+	}
+
+	payloadBytes := f.windowPayloadAvgBytes()
+	csvPayloadBytes := payloadBytes
+	if csvPayloadBytes <= 0 && f.lastCsvPayloadBytes > 0 {
+		csvPayloadBytes = f.lastCsvPayloadBytes
+	}
+	bwMbps := ratePpsToMbps(bwPps, csvPayloadBytes)
+	prevRateMbps := ratePpsToMbps(prevRate, csvPayloadBytes)
+	actualRateMbps := ratePpsToMbps(actualRate, csvPayloadBytes)
+	newRateMbps := ratePpsToMbps(newRate, csvPayloadBytes)
+	if controlState == "frozen" && len(f.window) == 0 && f.lastCsvMetricsValid {
+		bwMbps = f.lastCsvBWMbps
+		prevRateMbps = f.lastCsvPrevRateMbps
+		newRateMbps = f.lastCsvNewRateMbps
+	}
+	row := []string{
+		consumerCsvFloat(elapsedMs),
+		consumerCsvFloat(interestQ),
+		consumerCsvFloat(interestSlope),
+		consumerCsvFloat(dataQ),
+		consumerCsvFloat(bwMbps),
+		strconv.Itoa(bwSamples),
+		consumerCsvFloat(prevRateMbps),
+		consumerCsvFloat(actualRateMbps),
+		consumerCsvFloat(newRateMbps),
+		controlState,
+	}
+	if err := sink.writer.Write(row); err != nil {
+		log.Warn(consumerTag, "Failed to write consumer CSV row", "path", sink.path, "err", err)
+		return
+	}
+	f.lastCsvBWMbps = bwMbps
+	f.lastCsvPrevRateMbps = prevRateMbps
+	f.lastCsvActualRateMbps = actualRateMbps
+	f.lastCsvNewRateMbps = newRateMbps
+	if payloadBytes > 0 {
+		f.lastCsvPayloadBytes = payloadBytes
+	}
+	f.lastCsvMetricsValid = true
+	sink.writer.Flush()
+	if err := sink.writer.Error(); err != nil {
+		log.Warn(consumerTag, "Failed to flush consumer CSV", "path", sink.path, "err", err)
+	}
 }
 
 func (f *FlowContext) updatePDBaseName(tier int) {
@@ -403,14 +626,30 @@ func (f *FlowContext) QueueRetransmission(seq int) bool {
 	return true
 }
 
+// THREAD SAFETY: caller must hold f.mu.
+func (f *FlowContext) compactRetransmissionQueueLocked() {
+	if f.retxHead == 0 {
+		return
+	}
+	if f.retxHead < len(f.retxQueue)/2 && f.retxHead < 1024 {
+		return
+	}
+	copy(f.retxQueue[0:], f.retxQueue[f.retxHead:])
+	newLen := len(f.retxQueue) - f.retxHead
+	for i := newLen; i < len(f.retxQueue); i++ {
+		f.retxQueue[i] = 0
+	}
+	f.retxQueue = f.retxQueue[:newLen]
+	f.retxHead = 0
+}
+
 func (f *FlowContext) PopRetransmission() (int, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for len(f.retxQueue) > 0 {
-		seq := f.retxQueue[0]
-		copy(f.retxQueue[0:], f.retxQueue[1:])
-		f.retxQueue[len(f.retxQueue)-1] = 0
-		f.retxQueue = f.retxQueue[:len(f.retxQueue)-1]
+	for f.retxHead < len(f.retxQueue) {
+		seq := f.retxQueue[f.retxHead]
+		f.retxQueue[f.retxHead] = 0
+		f.retxHead++
 		if !f.retxQueued[seq] {
 			continue
 		}
@@ -421,8 +660,11 @@ func (f *FlowContext) PopRetransmission() (int, bool) {
 		if _, pending := f.pendingSends[f.interestNameForSeq(seq)]; !pending {
 			continue
 		}
+		f.compactRetransmissionQueueLocked()
 		return seq, true
 	}
+	f.retxQueue = f.retxQueue[:0]
+	f.retxHead = 0
 	return 0, false
 }
 
@@ -557,6 +799,12 @@ func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.T
 			log.Warn(consumerTag, "DT: Failed to deserialize packet", "err", err)
 			return false
 		}
+		if !f.firstDtDataLogged {
+			f.firstDtDataLogged = true
+			log.Debug(consumerTag, "First DT Data Received",
+				"prefix", f.Prefix,
+				"interestQsf", consumerLogFloat1(dataPacket.InterestQsf))
+		}
 
 		rttVal := float64(receiveTime.Sub(pending.SendTime).Nanoseconds()) / 1e6
 
@@ -580,7 +828,7 @@ func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.T
 		// rate control too, otherwise old send timestamps inflate RTT and collapse BW.
 		if !pending.Retransmitted {
 			f.updateRTT(receiveTime, rttVal)
-			f.updateRateControl(receiveTime, len(payload), rttVal, dataPacket.InterestQsf)
+			f.updateRateControl(receiveTime, len(payload), rttVal, dataPacket.InterestQsf, dataPacket.DataQsf)
 		}
 		return true
 	}
@@ -653,40 +901,53 @@ func (f *FlowContext) updateRTT(receiveTime time.Time, rttVal float64) {
 	f.rto = finalRTO
 }
 
-func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, rttVal float64, interestQsf float64) {
+func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, rttVal float64, interestQsf float64, dataQsf float64) {
+	f.observeInterestQsfBias(interestQsf)
 	f.lastRateSampleTime = receiveTime
 	f.window = append(f.window, PacketSample{
 		Timestamp:   receiveTime,
 		Size:        payloadSize,
 		RTT:         rttVal,
 		InterestQsf: interestQsf,
+		DataQsf:     dataQsf,
 	})
 	f.trimRateControlWindow(receiveTime)
+	if len(f.window) >= consumerQsfSampleLimit {
+		f.qsfWindowWarmed = true
+	}
 
 	if f.pktsCalibrated < 5 {
 		f.initialRTTSum += rttVal
 		f.pktsCalibrated++
 		if f.pktsCalibrated == 5 {
 			f.baseRTT = f.initialRTTSum / 5.0
-			// Use scaled bootstrap RTT as the control-update period, but do not
-			// allow very small RTTs to make the application control loop too noisy.
-			f.adjustmentPeriod = time.Duration(f.baseRTT * DT_CONTROL_PERIOD_RTT_SCALE * float64(time.Millisecond))
-			if f.adjustmentPeriod < 30*time.Millisecond {
-				f.adjustmentPeriod = 30 * time.Millisecond
-			}
+			f.adjustmentPeriod = consumerControlPeriodFromBootstrap(f.baseRTT)
 			f.lastRateUpdate = receiveTime
 			f.interestsSentInPeriod = 0
 			log.Info(consumerTag, "Flow Calibration Complete",
 				"flow", f.Prefix,
 				"mode", consumerRateControlModeString(),
 				"baseRTT", consumerLogFloat1(f.baseRTT),
+				"staticControlPeriod", DT_USE_STATIC_CONTROL_PERIOD,
 				"controlPeriodScale", DT_CONTROL_PERIOD_RTT_SCALE,
 				"adjustmentPeriod", f.adjustmentPeriod)
 		}
 		return
 	}
 
-	timeSinceLastUpdate := receiveTime.Sub(f.lastRateUpdate)
+	f.updateBandwidthEstimate(receiveTime, math.Max(f.correctedInterestQsf(interestQsf), dataQsf))
+}
+
+func (f *FlowContext) runPeriodicRateControl(now time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.Mode != ModeDT || f.pktsCalibrated < 5 || f.isFinished || f.adjustmentPeriod <= 0 || !f.bwBootstrapReady {
+		return
+	}
+
+	f.trimRateControlWindow(now)
+	timeSinceLastUpdate := now.Sub(f.lastRateUpdate)
 	if timeSinceLastUpdate < f.adjustmentPeriod {
 		return
 	}
@@ -696,11 +957,58 @@ func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, 
 		actualRate = float64(f.interestsSentInPeriod) / timeSinceLastUpdate.Seconds()
 	}
 
+	if len(f.window) == 0 && f.lastQsfObservationOk {
+		interestQ, interestSlope := f.computeInterestQsfSignal(now)
+		dataQ, _ := f.computeDataQsfSignal(now)
+		rule := "no-qsf-sample-retain"
+		f.lastBWUpdateRule = rule
+		oldRate := f.currentRate
+		f.lastRateUpdate = now
+		log.Debug(consumerTag, "Rate Control Frozen",
+			"mode", consumerRateControlModeString(),
+			"prefix", f.Prefix,
+			"interestQsfAvg", consumerLogFloat1(interestQ),
+			"interestQsfSlope", consumerLogFloat1(interestSlope),
+			"dataQsfAvg", consumerLogFloat1(dataQ),
+			"prevTargetRate", consumerLogFloat1(oldRate),
+			"actualRatePrevInterval", consumerLogFloat1(actualRate),
+			"nextTargetRate", consumerLogFloat1(f.currentRate),
+			"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
+			"bwUpdateRule", rule,
+			"bwSamples", f.bwSampleCountFromWindow(),
+			"action", "frozen-no-qsf-samples")
+		f.writeRateControlCsv(
+			now,
+			interestQ,
+			interestSlope,
+			dataQ,
+			f.estimatedBandwidth,
+			f.bwSampleCountFromWindow(),
+			oldRate,
+			actualRate,
+			f.currentRate,
+			"frozen",
+		)
+		f.interestsSentInPeriod = 0
+		return
+	}
+
+	if !f.bwCapActive &&
+		f.bwBootstrapReady &&
+		f.bwCapEligible &&
+		f.estimatedBandwidth >= DT_INIT_RATE {
+		f.bwCapActive = true
+		log.Debug(consumerTag, "DT BW cap activated",
+			"prefix", f.Prefix,
+			"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
+			"initRate", consumerLogFloat1(DT_INIT_RATE))
+	}
+
 	switch consumerRateControlMode {
 	case ConsumerRateControlQsf:
-		f.updateQsfRateControl(receiveTime, actualRate)
+		f.updateQsfRateControl(now, actualRate)
 	default:
-		f.updateDelayRateControl(receiveTime, actualRate)
+		f.updateDelayRateControl(now, actualRate)
 	}
 
 	f.interestsSentInPeriod = 0
@@ -720,6 +1028,101 @@ func (f *FlowContext) trimRateControlWindow(now time.Time) {
 	}
 }
 
+func consumerLatestQsfSamples(window []PacketSample) []PacketSample {
+	if len(window) <= consumerQsfSampleLimit {
+		return window
+	}
+	return window[len(window)-consumerQsfSampleLimit:]
+}
+
+func consumerComputeQsfSignal(now time.Time, samples []PacketSample, selector func(PacketSample) float64) (float64, float64) {
+	if len(samples) == 0 {
+		return 0, 0
+	}
+
+	tau := THROUGHPUT_WINDOW_DUR.Seconds() * consumerQsfRateControlParams.SlopeTauRatio
+	if tau <= 0 {
+		tau = THROUGHPUT_WINDOW_DUR.Seconds() / 3.0
+	}
+
+	var avgQsf float64
+	var sumW, sumWT, sumWQ, sumWTT, sumWTQ float64
+	for _, sample := range samples {
+		qsf := selector(sample)
+		avgQsf += qsf
+
+		t := sample.Timestamp.Sub(now).Seconds()
+		w := math.Exp(t / tau)
+		sumW += w
+		sumWT += w * t
+		sumWQ += w * qsf
+		sumWTT += w * t * t
+		sumWTQ += w * t * qsf
+	}
+	avgQsf /= float64(len(samples))
+
+	denom := sumW*sumWTT - sumWT*sumWT
+	if math.Abs(denom) < 1e-9 {
+		return avgQsf, 0
+	}
+	slope := (sumW*sumWTQ - sumWT*sumWQ) / denom
+	return avgQsf, slope
+}
+
+func (f *FlowContext) observeInterestQsfBias(rawQsf float64) {
+	if !DT_USE_QSF_BIAS_REMOVAL {
+		return
+	}
+	if f.interestQsfBiasReady {
+		return
+	}
+	f.interestQsfBiasSum += rawQsf
+	f.interestQsfBiasCount++
+	f.interestQsfBias = f.interestQsfBiasSum / float64(f.interestQsfBiasCount)
+	if f.interestQsfBiasCount >= consumerQsfSampleLimit {
+		f.interestQsfBiasReady = true
+		log.Debug(consumerTag, "DT interest QSF bias initialized",
+			"prefix", f.Prefix,
+			"interestQsfBias", consumerLogFloat1(f.interestQsfBias),
+			"samples", f.interestQsfBiasCount)
+	}
+}
+
+func (f *FlowContext) correctedInterestQsf(rawQsf float64) float64 {
+	if !DT_USE_QSF_BIAS_REMOVAL {
+		return rawQsf
+	}
+	corrected := rawQsf - f.interestQsfBias
+	if corrected < 0 {
+		return 0
+	}
+	return corrected
+}
+
+func (f *FlowContext) computeQsfSignalsLocked(now time.Time) (float64, float64, float64, float64) {
+	if len(f.window) == 0 {
+		if f.lastQsfObservationOk {
+			return f.lastInterestQsfAvg, f.lastInterestQsfSlope, f.lastDataQsfAvg, f.lastDataQsfSlope
+		}
+		return 0, 0, 0, 0
+	}
+
+	samples := consumerLatestQsfSamples(f.window)
+
+	interestQ, interestSlope := consumerComputeQsfSignal(now, samples, func(sample PacketSample) float64 {
+		return f.correctedInterestQsf(sample.InterestQsf)
+	})
+	dataQ, dataSlope := consumerComputeQsfSignal(now, samples, func(sample PacketSample) float64 {
+		return sample.DataQsf
+	})
+	f.lastInterestQsfAvg = interestQ
+	f.lastInterestQsfSlope = interestSlope
+	f.lastDataQsfAvg = dataQ
+	f.lastDataQsfSlope = dataSlope
+	f.lastQsfObservationOk = true
+	return interestQ, interestSlope, dataQ, dataSlope
+}
+
 func consumerRateControlModeString() string {
 	switch consumerRateControlMode {
 	case ConsumerRateControlQsf:
@@ -727,6 +1130,64 @@ func consumerRateControlModeString() string {
 	default:
 		return "delay"
 	}
+}
+
+func consumerControlPeriodFromBootstrap(baseRTT float64) time.Duration {
+	if DT_USE_STATIC_CONTROL_PERIOD {
+		return DT_STATIC_CONTROL_PERIOD
+	}
+	period := time.Duration(baseRTT * DT_CONTROL_PERIOD_RTT_SCALE * float64(time.Millisecond))
+	if period < DT_STATIC_CONTROL_PERIOD {
+		period = DT_STATIC_CONTROL_PERIOD
+	}
+	return period
+}
+
+func consumerBwObservationSpacing(period time.Duration) time.Duration {
+	if period <= 0 {
+		period = DT_STATIC_CONTROL_PERIOD
+	}
+	spacing := period / 3
+	if spacing <= 0 {
+		spacing = time.Millisecond
+	}
+	return spacing
+}
+
+func consumerBwTrend(observations []float64) bwTrend {
+	if len(observations) < 2 {
+		return bwTrendUnknown
+	}
+
+	increasing := true
+	decreasing := true
+	for i := 1; i < len(observations); i++ {
+		if observations[i] <= observations[i-1] {
+			increasing = false
+		}
+		if observations[i] >= observations[i-1] {
+			decreasing = false
+		}
+	}
+	switch {
+	case increasing:
+		return bwTrendIncreasing
+	case decreasing:
+		return bwTrendDecreasing
+	default:
+		return bwTrendFluctuating
+	}
+}
+
+func averageFloat64(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, value := range values {
+		sum += value
+	}
+	return sum / float64(len(values))
 }
 
 func consumerQsfActionString(action ConsumerQsfRateControlAction) string {
@@ -807,25 +1268,21 @@ func (f *FlowContext) measuredPPSFromWindow() float64 {
 	return float64(len(f.window)) / THROUGHPUT_WINDOW_DUR.Seconds()
 }
 
+func (f *FlowContext) bwSampleCountFromWindow() int {
+	return len(f.window)
+}
+
 func (f *FlowContext) updateDelayRateControl(receiveTime time.Time, actualRate float64) {
 	var totalWinRTT float64
 	for _, s := range f.window {
 		totalWinRTT += s.RTT
 	}
 	avgWinRTT := totalWinRTT / float64(len(f.window))
-	measuredPPS := f.measuredPPSFromWindow()
+	measuredPPS := f.lastMeasuredBandwidth
+	interestQ, interestSlope := f.computeInterestQsfSignal(receiveTime)
+	dataQ, _ := f.computeDataQsfSignal(receiveTime)
 
-	bwUpdateRule := "retain"
-	if measuredPPS > f.estimatedBandwidth {
-		f.estimatedBandwidth = measuredPPS
-		bwUpdateRule = "throughput-high"
-	}
-	if avgWinRTT > RC_RTT_LOW_THRESH_MULT*f.baseRTT {
-		f.estimatedBandwidth = measuredPPS
-		bwUpdateRule = "rtt-pressure"
-	}
-	f.lastMeasuredBandwidth = measuredPPS
-	f.lastBWUpdateRule = bwUpdateRule
+	bwUpdateRule := f.lastBWUpdateRule
 
 	targetRate := f.currentRate
 	if avgWinRTT < RC_RTT_LOW_THRESH_MULT*f.baseRTT {
@@ -834,20 +1291,22 @@ func (f *FlowContext) updateDelayRateControl(receiveTime time.Time, actualRate f
 		targetRate = f.estimatedBandwidth * RC_DEC_FACTOR
 	}
 
-	lower := RC_CAP_LOWER_MULT * f.estimatedBandwidth
-	if lower < 1.0 {
-		lower = 1.0
-	}
-	upper := RC_CAP_UPPER_MULT * f.estimatedBandwidth
-	if upper < DT_INIT_RATE {
-		upper = DT_INIT_RATE
-	}
+	if f.bwCapActive {
+		lower := RC_CAP_LOWER_MULT * f.estimatedBandwidth
+		if lower < 1.0 {
+			lower = 1.0
+		}
+		upper := RC_CAP_UPPER_MULT * f.estimatedBandwidth
+		if upper < DT_INIT_RATE {
+			upper = DT_INIT_RATE
+		}
 
-	if targetRate < lower {
-		targetRate = lower
-	}
-	if targetRate > upper {
-		targetRate = upper
+		if targetRate < lower {
+			targetRate = lower
+		}
+		if targetRate > upper {
+			targetRate = upper
+		}
 	}
 	if targetRate < RC_MIN_RATE {
 		targetRate = RC_MIN_RATE
@@ -862,22 +1321,35 @@ func (f *FlowContext) updateDelayRateControl(receiveTime time.Time, actualRate f
 	log.Debug(consumerTag, "Rate Adjusted",
 		"mode", "delay",
 		"prefix", f.Prefix,
-		"oldTargetRate", consumerLogFloat1(oldRate),
-		"newTargetRate", consumerLogFloat1(f.currentRate),
-		"actualRate", consumerLogFloat1(actualRate),
+		"prevTargetRate", consumerLogFloat1(oldRate),
+		"actualRatePrevInterval", consumerLogFloat1(actualRate),
+		"nextTargetRate", consumerLogFloat1(f.currentRate),
 		"measuredPPS", consumerLogFloat1(measuredPPS),
 		"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
 		"estimatedBWMbps", consumerLogFloat1(estimatedBWMbps),
 		"bwUpdateRule", bwUpdateRule,
 		"baseRTT", consumerLogFloat1(f.baseRTT),
 		"latestRTT", consumerLogFloat1(avgWinRTT))
+	f.writeRateControlCsv(
+		receiveTime,
+		interestQ,
+		interestSlope,
+		dataQ,
+		f.estimatedBandwidth,
+		f.bwSampleCountFromWindow(),
+		oldRate,
+		actualRate,
+		f.currentRate,
+		"normal",
+	)
 }
 
 func (f *FlowContext) updateQsfRateControl(receiveTime time.Time, actualRate float64) {
 	params := consumerQsfRateControlParams
 	currentQ, queueSlope := f.computeInterestQsfSignal(receiveTime)
+	dataQ, _ := f.computeDataQsfSignal(receiveTime)
 	measuredPPS := f.measuredPPSFromWindow()
-	bwUpdateRule := f.updateQsfBandwidthEstimate(measuredPPS, currentQ)
+	bwUpdateRule := f.lastBWUpdateRule
 
 	minRate := math.Max(params.MinRate, RC_MIN_RATE)
 	currentRate := f.currentRate
@@ -906,33 +1378,27 @@ func (f *FlowContext) updateQsfRateControl(receiveTime time.Time, actualRate flo
 		action = ConsumerQsfActionHoldDraining
 	} else {
 		if queueSlope > params.SlopeThreshold {
-			if f.estimatedBandwidth > 0 {
-				targetRate = f.estimatedBandwidth * params.CIFactor
-			} else {
-				targetRate = currentRate * params.CIFactor
-			}
+			targetRate = currentRate * params.CIFactor
 			action = ConsumerQsfActionCautiousIncrease
 		} else {
-			if f.estimatedBandwidth > 0 {
-				targetRate = f.estimatedBandwidth * params.RPFactor
-			} else {
-				targetRate = currentRate * params.RPFactor
-			}
+			targetRate = currentRate * params.RPFactor
 			action = ConsumerQsfActionAggressiveProbe
 		}
 	}
 
-	if f.estimatedBandwidth > 0 {
+	if f.bwCapActive && f.estimatedBandwidth > 0 {
 		upper := f.estimatedBandwidth * params.MaxBWSafetyRatio
 		if upper > 0 && targetRate > upper {
 			targetRate = upper
 			action = ConsumerQsfActionBWCapped
 		}
 
-		lower := f.estimatedBandwidth * params.MinBWSafetyRatio
-		if lower > 0 && targetRate < lower {
-			targetRate = lower
-			action = ConsumerQsfActionBWBoosted
+		if currentQ < qthLow {
+			lower := f.estimatedBandwidth * params.MinBWSafetyRatio
+			if lower > 0 && targetRate < lower {
+				targetRate = lower
+				action = ConsumerQsfActionBWBoosted
+			}
 		}
 	}
 
@@ -956,78 +1422,135 @@ func (f *FlowContext) updateQsfRateControl(receiveTime time.Time, actualRate flo
 		"prefix", f.Prefix,
 		"qsfAvg", consumerLogFloat1(currentQ),
 		"qsfSlope", consumerLogFloat1(queueSlope),
-		"oldTargetRate", consumerLogFloat1(oldRate),
-		"newTargetRate", consumerLogFloat1(f.currentRate),
-		"actualRate", consumerLogFloat1(actualRate),
+		"dataQsfAvg", consumerLogFloat1(dataQ),
+		"prevTargetRate", consumerLogFloat1(oldRate),
+		"actualRatePrevInterval", consumerLogFloat1(actualRate),
+		"nextTargetRate", consumerLogFloat1(f.currentRate),
 		"measuredPPS", consumerLogFloat1(measuredPPS),
 		"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
 		"estimatedBWMbps", consumerLogFloat1(estimatedBWMbps),
 		"bwUpdateRule", bwUpdateRule,
 		"action", consumerQsfActionString(action))
+	f.writeRateControlCsv(
+		receiveTime,
+		currentQ,
+		queueSlope,
+		dataQ,
+		f.estimatedBandwidth,
+		f.bwSampleCountFromWindow(),
+		oldRate,
+		actualRate,
+		f.currentRate,
+		"normal",
+	)
 }
 
 func (f *FlowContext) computeInterestQsfSignal(now time.Time) (float64, float64) {
-	if len(f.window) == 0 {
-		return 0, 0
-	}
-
-	tau := THROUGHPUT_WINDOW_DUR.Seconds() * consumerQsfRateControlParams.SlopeTauRatio
-	if tau <= 0 {
-		tau = THROUGHPUT_WINDOW_DUR.Seconds() / 3.0
-	}
-
-	var avgQsf float64
-	var sumW, sumWT, sumWQ, sumWTT, sumWTQ float64
-	for _, sample := range f.window {
-		qsf := sample.InterestQsf
-		avgQsf += qsf
-
-		t := sample.Timestamp.Sub(now).Seconds()
-		w := math.Exp(t / tau)
-		sumW += w
-		sumWT += w * t
-		sumWQ += w * qsf
-		sumWTT += w * t * t
-		sumWTQ += w * t * qsf
-	}
-	avgQsf /= float64(len(f.window))
-
-	denom := sumW*sumWTT - sumWT*sumWT
-	if math.Abs(denom) < 1e-9 {
-		return avgQsf, 0
-	}
-	slope := (sumW*sumWTQ - sumWT*sumWQ) / denom
-	return avgQsf, slope
+	interestQ, interestSlope, _, _ := f.computeQsfSignalsLocked(now)
+	return interestQ, interestSlope
 }
 
-func (f *FlowContext) updateQsfBandwidthEstimate(measuredPPS float64, queuePressureQsf float64) string {
-	prevBW := f.estimatedBandwidth
-	queueThreshold := consumerQsfRateControlParams.MaxQueueSize * consumerQsfRateControlParams.QueueAlpha
-	rule := "retain"
+func (f *FlowContext) computeDataQsfSignal(now time.Time) (float64, float64) {
+	_, _, dataQ, dataSlope := f.computeQsfSignalsLocked(now)
+	return dataQ, dataSlope
+}
 
-	switch {
-	case measuredPPS <= 0 && prevBW > 0:
-		rule = "no-sample-retain"
-	case prevBW <= 0:
-		f.estimatedBandwidth = measuredPPS
-		rule = "bootstrap"
-	case measuredPPS > prevBW:
-		f.estimatedBandwidth = measuredPPS
-		rule = "new-throughput-high"
-	case queuePressureQsf > queueThreshold:
-		f.estimatedBandwidth = measuredPPS
-		rule = "queue-pressure"
-	default:
-		f.estimatedBandwidth = prevBW
+func (f *FlowContext) updateBandwidthEstimate(now time.Time, queuePressureQsf float64) string {
+	if f.adjustmentPeriod <= 0 {
+		return f.lastBWUpdateRule
 	}
 
-	if measuredPPS <= 0 {
-		f.lastMeasuredBandwidth = measuredPPS
+	measuredPPS := f.measuredPPSFromWindow()
+	sampleCount := f.bwSampleCountFromWindow()
+	prevBW := f.estimatedBandwidth
+	rule := "retain"
+	f.lastMeasuredBandwidth = measuredPPS
+
+	switch {
+	case sampleCount < consumerBwSampleMin:
+		if sampleCount == 0 {
+			rule = "no-sample-retain"
+		} else if prevBW > 0 {
+			rule = "insufficient-sample-retain"
+		} else {
+			rule = "insufficient-sample-skip"
+		}
+	case measuredPPS <= 0 && prevBW > 0:
+		rule = "no-sample-retain"
+	}
+
+	if sampleCount < consumerBwSampleMin || measuredPPS <= 0 {
 		f.lastBWUpdateRule = rule
 		return rule
 	}
 
-	f.lastMeasuredBandwidth = measuredPPS
+	spacing := consumerBwObservationSpacing(f.adjustmentPeriod)
+	if !f.lastBwObservationTime.IsZero() && now.Sub(f.lastBwObservationTime) < spacing {
+		f.lastBWUpdateRule = "cadence-wait"
+		return f.lastBWUpdateRule
+	}
+
+	f.lastBwObservationTime = now
+	f.bwObservations = append(f.bwObservations, measuredPPS)
+	if len(f.bwObservations) > consumerBwObsLimit {
+		f.bwObservations = f.bwObservations[len(f.bwObservations)-consumerBwObsLimit:]
+	}
+
+	if !f.bwBootstrapReady {
+		if len(f.bwObservations) < consumerBwObsLimit {
+			f.lastBWUpdateRule = "bootstrap-collecting"
+			return f.lastBWUpdateRule
+		}
+
+		f.estimatedBandwidth = averageFloat64(f.bwObservations)
+		f.bwBootstrapReady = true
+		f.lastBWUpdateRule = "bootstrap-ready"
+		f.lastRateUpdate = now
+		f.interestsSentInPeriod = 0
+		log.Debug(consumerTag, "DT BW bootstrap ready",
+			"prefix", f.Prefix,
+			"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
+			"observations", len(f.bwObservations),
+			"observationSpacing", spacing)
+		return f.lastBWUpdateRule
+	}
+
+	latest := f.bwObservations[len(f.bwObservations)-1]
+	avgRecent := averageFloat64(f.bwObservations)
+	trend := consumerBwTrend(f.bwObservations)
+	qthLow := consumerQsfRateControlParams.MaxQueueSize * consumerQsfRateControlParams.QueueAlpha
+	triggerUp := measuredPPS > prevBW
+	triggerPressure := queuePressureQsf > qthLow
+	candidate := prevBW
+	alpha := 0.0
+
+	switch {
+	case triggerUp && trend == bwTrendIncreasing:
+		candidate = avgRecent
+		alpha = consumerBwAlphaUp
+		rule = "throughput-high-monotonic"
+	case triggerUp:
+		candidate = latest
+		alpha = consumerBwAlphaSmall
+		rule = "throughput-high-fluctuating"
+	case triggerPressure && trend == bwTrendDecreasing:
+		candidate = latest
+		alpha = consumerBwAlphaDown
+		rule = "queue-pressure-monotonic"
+	case triggerPressure:
+		candidate = latest
+		alpha = consumerBwAlphaSmall
+		rule = "queue-pressure-fluctuating"
+	default:
+		rule = "retain"
+	}
+
+	if alpha > 0 {
+		f.estimatedBandwidth = prevBW + alpha*(candidate-prevBW)
+		if f.estimatedBandwidth >= DT_INIT_RATE {
+			f.bwCapEligible = true
+		}
+	}
 	f.lastBWUpdateRule = rule
 	return rule
 }
@@ -1274,7 +1797,7 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 	interestName := interest.FinalName.String()
 	sendTime := time.Now()
 
-	if sequenceNum%200 == 0 || isRetransmission {
+	if sequenceNum%200 == 0 && !isRetransmission {
 		currentRate := flowCtx.GetRate()
 		log.Debug(consumerTag, "Interest Sent",
 			"name", interestName,
@@ -1335,15 +1858,36 @@ func sendSingleInterest(app ndn.Engine, stats *Statistics, sequenceNum int, flow
 
 // --- Main Flow Loop ---
 
+// runFlowRateControlLoop isolates per-flow rate control from the send/retransmit
+// loop so bursts of local work do not directly delay control execution.
+func runFlowRateControlLoop(flowCtx *FlowContext, stopCh <-chan struct{}) {
+	ticker := time.NewTicker(TICKER_INTERVAL)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		case tickNow := <-ticker.C:
+			flowCtx.checkRateControlNoFreshSamples(tickNow)
+			flowCtx.runPeriodicRateControl(tickNow)
+		}
+	}
+}
+
 func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.WaitGroup) {
 	defer wg.Done()
 	totalTimer := time.NewTimer(TOTAL_DURATION)
 	defer totalTimer.Stop()
 	ticker := time.NewTicker(TICKER_INTERVAL)
 	defer ticker.Stop()
+	controlStopCh := make(chan struct{})
+	defer close(controlStopCh)
+	go runFlowRateControlLoop(flowCtx, controlStopCh)
 
 	tokens := 0.0
 	sequenceNum := 0
+	lastTokenRefill := time.Now()
 
 	log.Info(consumerTag, "Starting flow", "target", flowCtx.Prefix, "mode", flowCtx.Mode)
 
@@ -1357,15 +1901,15 @@ func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.W
 			log.Info(consumerTag, "Flow resetting for DT", "prefix", flowCtx.Prefix)
 			tokens = 0.0
 			sequenceNum = 0
+			lastTokenRefill = time.Now()
 
-		case <-ticker.C:
-			flowCtx.checkRateControlNoFreshSamples(time.Now())
-
+		case tickNow := <-ticker.C:
 			// PD Logic: Pause Check
 			if flowCtx.Mode == ModePD {
 				flowCtx.mu.Lock()
 				if flowCtx.StopPD {
 					flowCtx.mu.Unlock()
+					lastTokenRefill = tickNow
 					continue
 				}
 				shouldSend := false
@@ -1380,12 +1924,18 @@ func runFlow(app ndn.Engine, stats *Statistics, flowCtx *FlowContext, wg *sync.W
 				flowCtx.mu.Unlock()
 
 				if !shouldSend {
+					lastTokenRefill = tickNow
 					continue
 				}
 			}
 
 			currentRate := flowCtx.GetRate()
-			tokens += currentRate * TICKER_INTERVAL.Seconds()
+			elapsed := tickNow.Sub(lastTokenRefill)
+			if elapsed < 0 {
+				elapsed = 0
+			}
+			tokens += currentRate * elapsed.Seconds()
+			lastTokenRefill = tickNow
 
 			for tokens >= 1.0 {
 				if flowCtx.Mode == ModeDT {
