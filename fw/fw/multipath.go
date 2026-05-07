@@ -96,12 +96,12 @@ const (
 	dtLivenessForcedPacketsPerStarvedRound = 2
 	dtLivenessForcedPacketsMax             = 32
 	dtLivenessStarvationLogThreshold       = 3
-	dtFaceInitRate                         = 600.0 //! Important, init rate is now assuming 6000 bytyes chunking, as comparison, consumer's flow init rate is also 3000 / 5 = 600
+	dtFaceInitRate                         = 700.0 //! Important, init rate is now assuming 6000 bytyes chunking, as comparison, consumer's flow init rate is also 3000 / 5 = 600
 	dtFaceTokenBurstCapPackets             = 64.0
 	dtRetainedBudgetCapPackets             = 1.0
 	dtBandwidthNoSampleWarnInterval        = 500 * time.Millisecond
 	//! Per-thread logical DT Interest queue capacity used to normalize InterestQsf.
-	dtInterestQueueCapacityPackets = 30.0
+	dtInterestQueueCapacityPackets = 20.0
 	// QSF smoothing uses only the latest few in-window samples even if the
 	// throughput window itself is larger for bandwidth estimation.
 	dtQsfSampleLimit = 3
@@ -432,6 +432,9 @@ type PathDiscoveryInfo struct {
 	// ---- Data Transmission ----
 	ActiveFaces     []uint64
 	ActiveFaceIndex int
+	// DT forwarding mode after PD converges for this prefix.
+	DtValidFaces             []uint64
+	DtFaceRateControlEnabled bool
 	// Bootstrap RR index for immediate DT forwarding before per-face shaping is fully ready.
 	DtBootstrapFaceRR       int
 	DtBootstrapProbeCounter int
@@ -837,14 +840,43 @@ func (s *Multipath) handleDataTransmissionInterest(
 	// 3. Get Info
 	info := s.getPathDiscoveryInfo(prefixKey)
 	info.mu.Lock()
-	s.ensureDtControlActivated(prefixKey, candidateFaces, time.Now())
-	readyFaces, unreadyFaces := splitDtShapingReadyFaces(candidateFaces)
+	dtFaces := candidateFaces
+	dtFaceRateControlEnabled := true
+	if info.IsNodeConverged {
+		if len(info.DtValidFaces) > 0 {
+			dtFaces = append([]uint64(nil), info.DtValidFaces...)
+		}
+		dtFaceRateControlEnabled = info.DtFaceRateControlEnabled
+	}
+	if len(dtFaces) == 0 {
+		info.mu.Unlock()
+		core.Log.Warn(s, "DT forwarding failed: no valid upstream face after PD",
+			"name", interestName,
+			"prefix", prefixKey)
+		return
+	}
+
+	if !dtFaceRateControlEnabled {
+		directFace := dtFaces[0]
+		info.mu.Unlock()
+		s.SendInterest(packet, pitEntry, directFace, inFace)
+		if seqNum >= 0 && seqNum%200 == 0 {
+			core.Log.Debug(s, "DT single-path immediate forward",
+				"name", interestName,
+				"prefix", prefixKey,
+				"face", directFace)
+		}
+		return
+	}
+
+	s.ensureDtControlActivated(prefixKey, dtFaces, time.Now())
+	readyFaces, unreadyFaces := splitDtShapingReadyFaces(dtFaces)
 
 	// Pre-shaping bootstrap mode:
 	// If no candidate face is ready for shaped scheduling yet, forward this Interest
 	// immediately using per-prefix RR across all candidate faces.
 	if len(readyFaces) == 0 {
-		bootstrapFace := selectDtBootstrapFaceRRLocked(info, candidateFaces)
+		bootstrapFace := selectDtBootstrapFaceRRLocked(info, dtFaces)
 		info.mu.Unlock()
 		s.SendInterest(packet, pitEntry, bootstrapFace, inFace)
 		if seqNum >= 0 && seqNum%200 == 0 {
@@ -852,7 +884,7 @@ func (s *Multipath) handleDataTransmissionInterest(
 				"name", interestName,
 				"prefix", prefixKey,
 				"face", bootstrapFace,
-				"candidateFaces", candidateFaces)
+				"candidateFaces", dtFaces)
 		}
 		return
 	}
@@ -882,7 +914,7 @@ func (s *Multipath) handleDataTransmissionInterest(
 		core.Log.Warn(s, "DT assignment failed: no usable upstream face",
 			"name", interestName,
 			"prefix", prefixKey,
-			"candidateFaces", candidateFaces,
+			"candidateFaces", dtFaces,
 			"readyFaces", readyFaces,
 			"unreadyFaces", unreadyFaces)
 		return
@@ -903,7 +935,7 @@ func (s *Multipath) handleDataTransmissionInterest(
 			"name", interestName,
 			"prefix", prefixKey,
 			"ownerThread", s.threadID,
-			"candidateFaces", candidateFaces,
+			"candidateFaces", dtFaces,
 			"readyFaces", readyFaces,
 			"unreadyFaces", unreadyFaces,
 			"assignedFace", assignedFace,
@@ -1735,12 +1767,18 @@ func (s *Multipath) handleTransmissionData(packet *defn.Pkt, pitEntry table.PitE
 	info := s.getPathDiscoveryInfo(prefix)
 	now := time.Now()
 	info.mu.Lock()
-	s.updateDtUpstreamMeasurements(info, prefix, inFace, now, len(originalContent), interestQsf, dataQsf)
-	s.maybeInitDtControlPeriodFromRtt(info, pitEntry, inFace, now)
+	singlePathDtBypass := info.IsNodeConverged && !info.DtFaceRateControlEnabled
+	if !singlePathDtBypass {
+		s.updateDtUpstreamMeasurements(info, prefix, inFace, now, len(originalContent), interestQsf, dataQsf)
+		s.maybeInitDtControlPeriodFromRtt(info, pitEntry, inFace, now)
+	}
 	info.mu.Unlock()
-	interestQueuePackets := float64(globalDtPrefixQueueLen(prefix))
-	interestQueueCapacity := dtGlobalInterestQueueCapacityPackets()
-	interestQueueQsf := normalizeDtQueueSignal(interestQueuePackets, interestQueueCapacity)
+	interestQueueQsf := interestQsf
+	if !singlePathDtBypass {
+		interestQueuePackets := float64(globalDtPrefixQueueLen(prefix))
+		interestQueueCapacity := dtGlobalInterestQueueCapacityPackets()
+		interestQueueQsf = normalizeDtQueueSignal(interestQueuePackets, interestQueueCapacity)
+	}
 
 	// Disabled to keep DT logs focused on scheduler analysis.
 	// if seqNum >= 0 && seqNum%100 == 0 {
@@ -1836,7 +1874,11 @@ func (s *Multipath) handleTransmissionData(packet *defn.Pkt, pitEntry table.PitE
 
 		faceDtPacket := *dtPacket
 		faceDtPacket.InterestQsf = interestQueueQsf
-		faceDtPacket.DataQsf = downstreamDataQsf
+		if singlePathDtBypass {
+			faceDtPacket.DataQsf = math.Max(dataQsf, downstreamDataQsf)
+		} else {
+			faceDtPacket.DataQsf = downstreamDataQsf
+		}
 
 		newContent, serializeErr := faceDtPacket.SerializeData()
 		if serializeErr != nil {
@@ -3629,24 +3671,36 @@ func (s *Multipath) localNodeConverged(info *PathDiscoveryInfo) {
 			core.Log.Info(s, " - Tier", "index", i, "cost", cost, "faces", faces)
 		}
 
-		// Pre-activate per-face DT scheduler states as soon as PD converges.
-		seen := make(map[uint64]bool)
-		candidateFaces := make([]uint64, 0, 8)
-		for _, tier := range info.TierList {
-			for _, hop := range tier {
-				if !seen[hop.Nexthop] {
-					seen[hop.Nexthop] = true
-					candidateFaces = append(candidateFaces, hop.Nexthop)
-				}
-			}
-		}
-		if len(candidateFaces) > 0 {
-			s.ensureDtControlActivated(info.Prefix, candidateFaces, time.Now())
+		info.DtValidFaces = flattenDtTierFaces(info.TierList)
+		info.DtFaceRateControlEnabled = len(info.DtValidFaces) > 1
+		info.DtBootstrapFaceRR = 0
+		info.DtBootstrapProbeCounter = 0
+		if info.DtFaceRateControlEnabled {
+			s.ensureDtControlActivated(info.Prefix, info.DtValidFaces, time.Now())
+		} else {
+			core.Log.Info(s, "DT prefix bypasses face rate control",
+				"prefix", info.Prefix,
+				"validFaces", info.DtValidFaces)
 		}
 		// ----------------------------------------
 
 		core.Log.Info(s, "Local Node Converged", "prefix", info.Prefix)
 	}
+}
+
+func flattenDtTierFaces(tiers [][]hopSnapshot) []uint64 {
+	seen := make(map[uint64]bool)
+	faces := make([]uint64, 0, 8)
+	for _, tier := range tiers {
+		for _, hop := range tier {
+			if seen[hop.Nexthop] {
+				continue
+			}
+			seen[hop.Nexthop] = true
+			faces = append(faces, hop.Nexthop)
+		}
+	}
+	return faces
 }
 
 // updateAfterPathDiscovery rebuilds the TierList based on valid results

@@ -958,8 +958,7 @@ func (f *FlowContext) runPeriodicRateControl(now time.Time) {
 	}
 
 	if len(f.window) == 0 && f.lastQsfObservationOk {
-		interestQ, interestSlope := f.computeInterestQsfSignal(now)
-		dataQ, _ := f.computeDataQsfSignal(now)
+		currentQ, queueSlope, selectedSignal, interestQ, interestSlope, dataQ, _ := f.computeDominantQsfSignal(now)
 		rule := "no-qsf-sample-retain"
 		f.lastBWUpdateRule = rule
 		oldRate := f.currentRate
@@ -967,6 +966,9 @@ func (f *FlowContext) runPeriodicRateControl(now time.Time) {
 		log.Debug(consumerTag, "Rate Control Frozen",
 			"mode", consumerRateControlModeString(),
 			"prefix", f.Prefix,
+			"qsfSignal", selectedSignal,
+			"qsfAvg", consumerLogFloat1(currentQ),
+			"qsfSlope", consumerLogFloat1(queueSlope),
 			"interestQsfAvg", consumerLogFloat1(interestQ),
 			"interestQsfSlope", consumerLogFloat1(interestSlope),
 			"dataQsfAvg", consumerLogFloat1(dataQ),
@@ -1346,8 +1348,7 @@ func (f *FlowContext) updateDelayRateControl(receiveTime time.Time, actualRate f
 
 func (f *FlowContext) updateQsfRateControl(receiveTime time.Time, actualRate float64) {
 	params := consumerQsfRateControlParams
-	currentQ, queueSlope := f.computeInterestQsfSignal(receiveTime)
-	dataQ, _ := f.computeDataQsfSignal(receiveTime)
+	currentQ, queueSlope, selectedSignal, interestQ, interestSlope, dataQ, dataSlope := f.computeDominantQsfSignal(receiveTime)
 	measuredPPS := f.measuredPPSFromWindow()
 	bwUpdateRule := f.lastBWUpdateRule
 
@@ -1420,9 +1421,13 @@ func (f *FlowContext) updateQsfRateControl(receiveTime time.Time, actualRate flo
 	log.Debug(consumerTag, "Rate Adjusted",
 		"mode", "qsf",
 		"prefix", f.Prefix,
+		"qsfSignal", selectedSignal,
 		"qsfAvg", consumerLogFloat1(currentQ),
 		"qsfSlope", consumerLogFloat1(queueSlope),
+		"interestQsfAvg", consumerLogFloat1(interestQ),
+		"interestQsfSlope", consumerLogFloat1(interestSlope),
 		"dataQsfAvg", consumerLogFloat1(dataQ),
+		"dataQsfSlope", consumerLogFloat1(dataSlope),
 		"prevTargetRate", consumerLogFloat1(oldRate),
 		"actualRatePrevInterval", consumerLogFloat1(actualRate),
 		"nextTargetRate", consumerLogFloat1(f.currentRate),
@@ -1453,6 +1458,14 @@ func (f *FlowContext) computeInterestQsfSignal(now time.Time) (float64, float64)
 func (f *FlowContext) computeDataQsfSignal(now time.Time) (float64, float64) {
 	_, _, dataQ, dataSlope := f.computeQsfSignalsLocked(now)
 	return dataQ, dataSlope
+}
+
+func (f *FlowContext) computeDominantQsfSignal(now time.Time) (float64, float64, string, float64, float64, float64, float64) {
+	interestQ, interestSlope, dataQ, dataSlope := f.computeQsfSignalsLocked(now)
+	if interestQ >= dataQ {
+		return interestQ, interestSlope, "interest", interestQ, interestSlope, dataQ, dataSlope
+	}
+	return dataQ, dataSlope, "data", interestQ, interestSlope, dataQ, dataSlope
 }
 
 func (f *FlowContext) updateBandwidthEstimate(now time.Time, queuePressureQsf float64) string {

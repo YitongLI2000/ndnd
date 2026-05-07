@@ -15,15 +15,16 @@ import sys
 #  SCALING CONFIGURATION
 # ==============================================================================
 
-# 1. Number of Consumers (1 to 3)
+# 1. Number of Consumers (1 to 5)
 #    - 1: Only con0 is active.
 #    - 2: con0 and con1 are active.
-#    - 3: con0, con1, and con2 are active.
-NUM_ACTIVE_CONSUMERS = 3
+#    - 5: con0, con1, con2, con3, and con4 are active.
+NUM_ACTIVE_CONSUMERS = 5
 
 # 2. Number of Producers per Consumer (1 to 5)
 #    - This determines how many producers each active consumer requests data from.
-#    - The topology groups producers in blocks of 5 (pro0-4, pro5-9, pro10-14).
+#    - The topology groups producers in blocks of 5
+#      (pro0-4, pro5-9, pro10-14, pro15-19, pro20-24).
 #    - Example: If set to 1, con0 talks to pro0.
 #    - Example: If set to 5, con0 talks to pro0, pro1, pro2, pro3, pro4.
 NUM_PRODUCERS_PER_CONSUMER = 5
@@ -37,7 +38,9 @@ CON_TO_CORE_LOSS = 0
 CONSUMER_START_DELAYS = {
     'con0': 0,   # Starts immediately
     'con1': 1,   # Starts 1 seconds later
-    'con2': 2,  # Starts 2 seconds later
+    'con2': 2,   # Starts 2 seconds later
+    'con3': 1,   # Starts 3 seconds later
+    'con4': 2,   # Starts 4 seconds later
 }
 
 # 5. Post-Run Behavior
@@ -65,7 +68,7 @@ DV_TYPE_PARAMS = {
 # One editable parameter block per node type.
 FW_TYPE_PARAMS = {
     'con': {
-        'core_log_level': "INFO",
+        'core_log_level': "DEBUG",
         'udp_enabled_unicast': True,
         'udp_enabled_multicast': False,
         'udp_port_unicast': 6363,
@@ -95,7 +98,7 @@ FW_TYPE_PARAMS = {
         'threads': 2,
     },
     'pro': {
-        'core_log_level': "INFO",
+        'core_log_level': "DEBUG",
         'udp_enabled_unicast': True,
         'udp_enabled_multicast': False,
         'udp_port_unicast': 6363,
@@ -109,64 +112,51 @@ FW_TYPE_PARAMS = {
 # ==============================================================================
 #  TOPOLOGY DEFINITION (Fixed Physical Layout)
 # ==============================================================================
-NODES = [
-    # 15 Producers
-    'pro0', 'pro1', 'pro2', 'pro3', 'pro4', 'pro5', 'pro6', 'pro7', 'pro8', 'pro9', 
-    'pro10', 'pro11', 'pro12', 'pro13', 'pro14',
-    # 3 Consumers
-    'con0', 'con1', 'con2', 
-    # 15 Edges
-    'edge0', 'edge1', 'edge2', 'edge3', 'edge4', 'edge5', 'edge6', 'edge7', 'edge8', 'edge9', 
-    'edge10', 'edge11', 'edge12', 'edge13', 'edge14', 
-    # 5 Cores
-    'core0', 'core1', 'core2', 'core3', 'core4'
-]
+TOTAL_TOPO_CONSUMERS = 5
+TOTAL_TOPO_CORES = 5
+PRODUCERS_PER_BLOCK = 5
+TOTAL_TOPO_PRODUCERS = TOTAL_TOPO_CONSUMERS * PRODUCERS_PER_BLOCK
+TOTAL_TOPO_EDGES = TOTAL_TOPO_PRODUCERS
 
-LINKS = [
+
+def build_fixed_nodes():
+    nodes = []
+    nodes.extend(f'pro{i}' for i in range(TOTAL_TOPO_PRODUCERS))
+    nodes.extend(f'con{i}' for i in range(TOTAL_TOPO_CONSUMERS))
+    nodes.extend(f'edge{i}' for i in range(TOTAL_TOPO_EDGES))
+    nodes.extend(f'core{i}' for i in range(TOTAL_TOPO_CORES))
+    return nodes
+
+
+def build_fixed_links():
+    links = []
+
     # Producers to Edges (Lossless)
-    ('pro0', 'edge0', 40, '1ms', 1000, 0), ('pro1', 'edge1', 40, '1ms', 1000, 0),
-    ('pro2', 'edge2', 40, '1ms', 1000, 0), ('pro3', 'edge3', 40, '1ms', 1000, 0),
-    ('pro4', 'edge4', 40, '1ms', 1000, 0), ('pro5', 'edge5', 40, '1ms', 1000, 0),
-    ('pro6', 'edge6', 40, '1ms', 1000, 0), ('pro7', 'edge7', 40, '1ms', 1000, 0),
-    ('pro8', 'edge8', 40, '1ms', 1000, 0), ('pro9', 'edge9', 40, '1ms', 1000, 0),
-    ('pro10', 'edge10', 40, '1ms', 1000, 0), ('pro11', 'edge11', 40, '1ms', 1000, 0),
-    ('pro12', 'edge12', 40, '1ms', 1000, 0), ('pro13', 'edge13', 40, '1ms', 1000, 0),
-    ('pro14', 'edge14', 40, '1ms', 1000, 0), 
-    
-    # Edges to Core0 (Edges 0-4)
-    ('edge0', 'core0', 40, '1ms', 1000, 0), ('edge1', 'core0', 40, '1ms', 1000, 0),
-    ('edge2', 'core0', 40, '1ms', 1000, 0), ('edge3', 'core0', 40, '1ms', 1000, 0),
-    ('edge4', 'core0', 40, '1ms', 1000, 0),
-    # Edges to Core1 (Edges 5-9)
-    ('edge5', 'core1', 40, '1ms', 1000, 0), ('edge6', 'core1', 40, '1ms', 1000, 0),
-    ('edge7', 'core1', 40, '1ms', 1000, 0), ('edge8', 'core1', 40, '1ms', 1000, 0),
-    ('edge9', 'core1', 40, '1ms', 1000, 0),
-    # Edges to Core2 (Edges 10-14)
-    ('edge10', 'core2', 40, '1ms', 1000, 0), ('edge11', 'core2', 40, '1ms', 1000, 0),
-    ('edge12', 'core2', 40, '1ms', 1000, 0), ('edge13', 'core2', 40, '1ms', 1000, 0),
-    ('edge14', 'core2', 40, '1ms', 1000, 0),
+    for producer_idx in range(TOTAL_TOPO_PRODUCERS):
+        links.append((f'pro{producer_idx}', f'edge{producer_idx}', 40, '5ms', 1000, 0))
 
-    # Consumer to Cores (With Configurable Loss)
-    # con0 -> Mesh
-    ('con0', 'core0', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con0', 'core1', 40, '1ms', 1000, CON_TO_CORE_LOSS),
-    ('con0', 'core2', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con0', 'core3', 40, '1ms', 1000, CON_TO_CORE_LOSS),
-    ('con0', 'core4', 40, '1ms', 1000, CON_TO_CORE_LOSS),
-    # con1 -> Mesh
-    ('con1', 'core0', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con1', 'core1', 40, '1ms', 1000, CON_TO_CORE_LOSS),
-    ('con1', 'core2', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con1', 'core3', 40, '1ms', 1000, CON_TO_CORE_LOSS),
-    ('con1', 'core4', 40, '1ms', 1000, CON_TO_CORE_LOSS),
-    # con2 -> Mesh
-    ('con2', 'core0', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con2', 'core1', 40, '1ms', 1000, CON_TO_CORE_LOSS),
-    ('con2', 'core2', 40, '1ms', 1000, CON_TO_CORE_LOSS), ('con2', 'core3', 40, '1ms', 1000, CON_TO_CORE_LOSS),
-    ('con2', 'core4', 40, '1ms', 1000, CON_TO_CORE_LOSS),
+    # Each block of 5 edges uplinks to its corresponding core.
+    for core_idx in range(TOTAL_TOPO_CORES):
+        start_edge = core_idx * PRODUCERS_PER_BLOCK
+        end_edge = start_edge + PRODUCERS_PER_BLOCK
+        for edge_idx in range(start_edge, end_edge):
+            links.append((f'edge{edge_idx}', f'core{core_idx}', 40, '5ms', 1000, 0))
 
-    # Core Mesh (Lossless)
-    ('core0', 'core1', 40, '1ms', 1000, 0), ('core0', 'core2', 40, '1ms', 1000, 0),
-    ('core0', 'core3', 40, '1ms', 1000, 0), ('core0', 'core4', 40, '1ms', 1000, 0),
-    ('core1', 'core2', 40, '1ms', 1000, 0), ('core1', 'core3', 40, '1ms', 1000, 0),
-    ('core1', 'core4', 40, '1ms', 1000, 0), ('core2', 'core3', 40, '1ms', 1000, 0),
-    ('core2', 'core4', 40, '1ms', 1000, 0), ('core3', 'core4', 40, '1ms', 1000, 0)
-]
+    # Consumers connect to every core.
+    for consumer_idx in range(TOTAL_TOPO_CONSUMERS):
+        for core_idx in range(TOTAL_TOPO_CORES):
+            links.append((f'con{consumer_idx}', f'core{core_idx}', 40, '1ms', 1000, CON_TO_CORE_LOSS))
+
+    # Full core mesh (Lossless).
+    for src_core in range(TOTAL_TOPO_CORES):
+        for dst_core in range(src_core + 1, TOTAL_TOPO_CORES):
+            links.append((f'core{src_core}', f'core{dst_core}', 40, '1ms', 1000, 0))
+
+    return links
+
+
+NODES = build_fixed_nodes()
+LINKS = build_fixed_links()
 
 # ==============================================================================
 #  HELPER CLASSES
@@ -174,8 +164,8 @@ LINKS = [
 
 def check_scaling_limits():
     """Ensures the scaling configuration fits within the physical topology."""
-    MAX_TOPO_CONSUMERS = 3
-    MAX_TOPO_PRODUCERS_PER_BLOCK = 5 
+    MAX_TOPO_CONSUMERS = TOTAL_TOPO_CONSUMERS
+    MAX_TOPO_PRODUCERS_PER_BLOCK = PRODUCERS_PER_BLOCK
 
     print("\n🔍 Checking Scaling Configuration...")
     
@@ -190,7 +180,7 @@ def check_scaling_limits():
     print(f"✅ Configuration Valid: {NUM_ACTIVE_CONSUMERS} Consumer(s), {NUM_PRODUCERS_PER_CONSUMER} Producer(s) per Consumer.")
     print("📋 Planned Mapping:")
     for i in range(NUM_ACTIVE_CONSUMERS):
-        start_idx = i * 5
+        start_idx = i * PRODUCERS_PER_BLOCK
         end_idx = start_idx + NUM_PRODUCERS_PER_CONSUMER - 1
         print(f"   - con{i} will request from: pro{start_idx} ... pro{end_idx} (Count: {NUM_PRODUCERS_PER_CONSUMER})")
     print("")
@@ -313,6 +303,22 @@ def regenerate_all_node_configs(allocator):
 
     print(f"Regenerated {len(NODES)} node config files in {configs_dir}")
 
+
+def clear_logs_dir():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    logs_dir = os.path.join(script_dir, '..', 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
+
+    removed_count = 0
+    for entry in os.scandir(logs_dir):
+        if not entry.is_file():
+            continue
+        os.unlink(entry.path)
+        removed_count += 1
+
+    print(f"Cleared {removed_count} existing log file(s) from {logs_dir}")
+    return logs_dir
+
 # ==============================================================================
 #  SETUP & EXECUTION
 # ==============================================================================
@@ -385,8 +391,7 @@ def start_ndnd_daemons(net, allocator):
     print(f"\nStarting ndnd daemons on {len(NODES)} nodes...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     configs_dir = os.path.join(script_dir, '..', 'configs')
-    logs_dir = os.path.join(script_dir, '..', 'logs')
-    os.makedirs(logs_dir, exist_ok=True)
+    logs_dir = clear_logs_dir()
 
     # Always regenerate/override all configs from the current topology before daemon start.
     regenerate_all_node_configs(allocator)
@@ -411,19 +416,43 @@ def stop_ndnd_daemons(net):
         node.cmd('rm -f /run/nfd/nfd.sock')
     print("Cleanup complete.")
 
-def configure_dynamic_routing(net):
+def get_consumer_core_face_ids(con_node, con_name, allocator):
+    core_neighbor_ips = {
+        allocator.get_link_ip(f'core{i}', con_name)
+        for i in range(TOTAL_TOPO_CORES)
+    }
+    core_neighbor_ips.discard(None)
+
+    face_output = con_node.cmd('ndnd fw face-list')
+    core_faces = []
+    for line in face_output.split('\n'):
+        if 'remote=udp4://' not in line:
+            continue
+        face_match = re.search(r'faceid=(\d+)', line)
+        remote_match = re.search(r'remote=udp4://([0-9.]+):\d+', line)
+        if not face_match or not remote_match:
+            continue
+        remote_ip = remote_match.group(1)
+        if remote_ip in core_neighbor_ips:
+            core_faces.append(int(face_match.group(1)))
+
+    core_faces = sorted(set(core_faces))
+    if len(core_faces) != TOTAL_TOPO_CORES:
+        print(
+            f"⚠️  {con_name}: discovered {len(core_faces)} direct core face(s) "
+            f"(expected {TOTAL_TOPO_CORES}). faceids={core_faces}"
+        )
+    return core_faces
+
+
+def configure_dynamic_routing(net, allocator):
     print(f"\n=== Configuring Dynamic Routes for {NUM_ACTIVE_CONSUMERS} Consumers ===")
     consumers = [f'con{i}' for i in range(NUM_ACTIVE_CONSUMERS)]
     
     for con_name in consumers:
         con_node = net.get(con_name)
-        # 1. Get UDP Faces
-        face_output = con_node.cmd('ndnd fw face-list')
-        udp_faces = []
-        for line in face_output.split('\n'):
-            if 'remote=udp4://' in line:
-                match = re.search(r'faceid=(\d+)', line)
-                if match: udp_faces.append(int(match.group(1)))
+        # 1. Get the 5 direct consumer->core UDP faces from the physical topology.
+        core_faces = get_consumer_core_face_ids(con_node, con_name, allocator)
         
         # 2. Get Discovered Routes (via NLSR/DV)
         route_output = con_node.cmd('ndnd fw route-list')
@@ -447,20 +476,24 @@ def configure_dynamic_routing(net):
         added_count = 0
         for prefix, data in prefix_data.items():
             target_cost = data['max_cost']
-            for face_id in udp_faces:
+            for face_id in core_faces:
                 if face_id not in data['faces']:
                     con_node.cmd(f"ndnd fw route-add prefix={prefix} face={face_id} cost={target_cost}")
                     added_count += 1
         
-        print(f"  -> {con_name}: Added {added_count} multipath routes.")
-        con_node.cmd('ndnd fw strategy-set prefix=/ strategy=/localhost/nfd/strategy/multipath/v=1')
+        print(f"  -> {con_name}: Added {added_count} consumer-core backup routes across {len(core_faces)} core face(s).")
 
-    print(f"\n=== Configuring Strategy for Producers ===")
-    producers = [n for n in NODES if n.startswith('pro')]
-    for pro_name in producers:
-        pro_node = net.get(pro_name)
-        pro_node.cmd('ndnd fw strategy-set prefix=/ strategy=/localhost/nfd/strategy/multipath/v=1')
-        print(f"  -> {pro_name}: Strategy set to multipath.")
+    print(f"\n=== Configuring Strategy by Layer ===")
+    strategy_groups = collections.OrderedDict([
+        ("Consumers", ([f'con{i}' for i in range(TOTAL_TOPO_CONSUMERS)], "/localhost/nfd/strategy/multipath/v=1")),
+        ("Cores", ([f'core{i}' for i in range(TOTAL_TOPO_CORES)], "/localhost/nfd/strategy/best-route/v=1")),
+        ("Edges", ([f'edge{i}' for i in range(TOTAL_TOPO_EDGES)], "/localhost/nfd/strategy/best-route/v=1")),
+        ("Producers", ([f'pro{i}' for i in range(TOTAL_TOPO_PRODUCERS)], "/localhost/nfd/strategy/multipath/v=1")),
+    ])
+    for group_name, (node_names, strategy_name) in strategy_groups.items():
+        for node_name in node_names:
+            net.get(node_name).cmd(f'ndnd fw strategy-set prefix=/ strategy={strategy_name}')
+        print(f"  -> {group_name}: Strategy set to {strategy_name} on {len(node_names)} node(s).")
 
 def verify_dynamic_routing_shape_or_die(net):
     if NUM_ACTIVE_CONSUMERS <= 0:
@@ -528,7 +561,7 @@ def run_applications(net):
     # 1. Identify Needed Producers based on Scaling Config
     producers_needed = []
     for i in range(NUM_ACTIVE_CONSUMERS):
-        start_idx = i * 5
+        start_idx = i * PRODUCERS_PER_BLOCK
         # range is exclusive in Python, so we go up to start + N
         end_idx = start_idx + NUM_PRODUCERS_PER_CONSUMER
         producers_needed.extend(range(start_idx, end_idx))
@@ -550,7 +583,7 @@ def run_applications(net):
     print("Waiting 5s for producers to register...")
     time.sleep(5)
 
-    configure_dynamic_routing(net)
+    configure_dynamic_routing(net, allocator)
     verify_dynamic_routing_shape_or_die(net)
 
     print(f"\n=== Starting {NUM_ACTIVE_CONSUMERS} Consumer Applications ===")
@@ -564,8 +597,8 @@ def run_applications(net):
         
         # Calculate Range Argument for Go App
         # Go App expects "start-end" (inclusive)
-        start_idx = i * 5
-        end_idx = (i * 5) + NUM_PRODUCERS_PER_CONSUMER - 1
+        start_idx = i * PRODUCERS_PER_BLOCK
+        end_idx = (i * PRODUCERS_PER_BLOCK) + NUM_PRODUCERS_PER_CONSUMER - 1
         range_arg = f"{start_idx}-{end_idx}"
         
         delay = CONSUMER_START_DELAYS.get(c_name, 0)
