@@ -9,6 +9,8 @@ import (
 // Data packet layout parameters.
 // Change DataPacketValueCount to adjust DT payload vector length globally.
 const (
+	// 750 values yields a serialized DT payload of 6016 bytes:
+	// 16 bytes metadata + 750 * 8 bytes values.
 	DataPacketValueCount = 750
 	float64SizeBytes     = 8
 	dataPacketMetaFields = 2 // InterestQsf + DataQsf

@@ -120,19 +120,19 @@ var consumerQsfRateControlParams = ConsumerQsfRateControlParams{
 	NoSampleWarnEvery: 500 * time.Millisecond,
 }
 
-// Historical hardcoded DT tuning (for DataPacketValueCount=150):
-// MAX_PACKETS = 15000
-// DT_INIT_RATE = 3000.0
-// THROUGHPUT_WINDOW_DUR = 20 * time.Millisecond
-// RC_MIN_RATE = 10.0
+// Historical DT tuning was configured in pps against a smaller reference
+// payload. Keep the same effective Mbps/byte-budget behavior and derive the
+// runtime pps values from the actual serialized DT payload size.
 const (
-	baseMaxPackets         = 15000
-	baseDTInitRate         = 3000.0
-	baseThroughputWindow   = 20 * time.Millisecond //! Sliding window duration
-	baseRCMinRate          = 10.0
-	baseDataPacketSizeByte = 16 + (150 * 8) // InterestQsf + DataQsf + 150 float64 values
-	consumerQsfSampleLimit = 3
-	consumerBwSampleMin    = 2
+	baseMaxPackets                 = 15000
+	legacyDtInitRatePps            = 3000.0
+	legacyDtMinRatePps             = 10.0
+	legacyReferenceDataPacketBytes = 16 + (150 * 8)
+	targetDtInitMbps               = (legacyDtInitRatePps * legacyReferenceDataPacketBytes * 8.0) / 1e6
+	targetDtMinRateMbps            = (legacyDtMinRatePps * legacyReferenceDataPacketBytes * 8.0) / 1e6
+	baseThroughputWindow           = 20 * time.Millisecond //! Sliding window duration
+	consumerQsfSampleLimit         = 3
+	consumerBwSampleMin            = 2
 	//! Bw estimation
 	consumerBwObsLimit   = 3
 	consumerBwAlphaUp    = 0.25
@@ -144,9 +144,9 @@ const consumerStatsCsvDir = "std/examples/mars/logs"
 
 var (
 	MAX_PACKETS           = baseMaxPackets
-	DT_INIT_RATE          = baseDTInitRate
+	DT_INIT_RATE          = legacyDtInitRatePps
 	THROUGHPUT_WINDOW_DUR = baseThroughputWindow
-	RC_MIN_RATE           = baseRCMinRate
+	RC_MIN_RATE           = legacyDtMinRatePps
 )
 
 // --- Asynchronous Workload Settings ---
@@ -163,6 +163,13 @@ var consumerTag = ConsumerTag{}
 
 func consumerLogFloat1(v float64) float64 {
 	return math.Round(v*10) / 10
+}
+
+func rateMbpsToPps(rateMbps float64, payloadBytes float64) float64 {
+	if rateMbps <= 0 || payloadBytes <= 0 {
+		return 0
+	}
+	return (rateMbps * 1e6) / (payloadBytes * 8.0)
 }
 
 type TransmissionMode int
@@ -194,14 +201,15 @@ func applyAdaptiveDtTunables() {
 		return
 	}
 
-	scale := float64(baseDataPacketSizeByte) / float64(currentPktSize)
+	payloadBytes := float64(currentPktSize)
+	scale := float64(legacyReferenceDataPacketBytes) / payloadBytes
 	if scale <= 0 {
 		log.Warn(consumerTag, "Adaptive DT tuning disabled: invalid scale", "scale", scale)
 		return
 	}
 
-	DT_INIT_RATE = math.Max(1.0, baseDTInitRate*scale)
-	RC_MIN_RATE = math.Max(1.0, baseRCMinRate*scale)
+	DT_INIT_RATE = math.Max(1.0, rateMbpsToPps(targetDtInitMbps, payloadBytes))
+	RC_MIN_RATE = math.Max(1.0, rateMbpsToPps(targetDtMinRateMbps, payloadBytes))
 	MAX_PACKETS = int(math.Max(1.0, math.Round(float64(baseMaxPackets)*scale)))
 	// Keep DT sliding-window duration static (no chunk-size shaping).
 	THROUGHPUT_WINDOW_DUR = baseThroughputWindow
@@ -209,8 +217,10 @@ func applyAdaptiveDtTunables() {
 	log.Info(consumerTag, "Adaptive DT tuning applied",
 		"dataPacketSizeBytes", currentPktSize,
 		"scale", scale,
-		"DT_INIT_RATE", DT_INIT_RATE,
-		"RC_MIN_RATE", RC_MIN_RATE,
+		"DT_INIT_RATE_Pps", consumerLogFloat1(DT_INIT_RATE),
+		"DT_INIT_RATE_Mbps", consumerLogFloat1(ratePpsToMbps(DT_INIT_RATE, payloadBytes)),
+		"RC_MIN_RATE_Pps", consumerLogFloat1(RC_MIN_RATE),
+		"RC_MIN_RATE_Mbps", consumerLogFloat1(ratePpsToMbps(RC_MIN_RATE, payloadBytes)),
 		"MAX_PACKETS", MAX_PACKETS,
 		"THROUGHPUT_WINDOW_DUR", THROUGHPUT_WINDOW_DUR)
 }
@@ -1000,10 +1010,16 @@ func (f *FlowContext) runPeriodicRateControl(now time.Time) {
 		f.bwCapEligible &&
 		f.estimatedBandwidth >= DT_INIT_RATE {
 		f.bwCapActive = true
+		payloadBytes := f.windowPayloadAvgBytes()
+		if payloadBytes <= 0 {
+			payloadBytes = float64(datapacket.NewDataPacket().GetSize())
+		}
 		log.Debug(consumerTag, "DT BW cap activated",
 			"prefix", f.Prefix,
-			"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
-			"initRate", consumerLogFloat1(DT_INIT_RATE))
+			"estimatedBW_Pps", consumerLogFloat1(f.estimatedBandwidth),
+			"estimatedBW_Mbps", consumerLogFloat1(ratePpsToMbps(f.estimatedBandwidth, payloadBytes)),
+			"initRatePps", consumerLogFloat1(DT_INIT_RATE),
+			"initRateMbps", consumerLogFloat1(ratePpsToMbps(DT_INIT_RATE, payloadBytes)))
 	}
 
 	switch consumerRateControlMode {

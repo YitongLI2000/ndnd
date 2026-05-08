@@ -96,7 +96,9 @@ const (
 	dtLivenessForcedPacketsPerStarvedRound = 2
 	dtLivenessForcedPacketsMax             = 32
 	dtLivenessStarvationLogThreshold       = 3
-	dtFaceInitRate                         = 700.0 //! Important, init rate is now assuming 6000 bytyes chunking, as comparison, consumer's flow init rate is also 3000 / 5 = 600
+	legacyDtFaceInitRatePps                = 700.0
+	legacyDtFaceInitPacketBytes            = 16 + (750 * 8)
+	targetDtFaceInitMbps                   = (legacyDtFaceInitRatePps * legacyDtFaceInitPacketBytes * 8.0) / 1e6
 	dtFaceTokenBurstCapPackets             = 64.0
 	dtRetainedBudgetCapPackets             = 1.0
 	dtBandwidthNoSampleWarnInterval        = 500 * time.Millisecond
@@ -141,6 +143,7 @@ var (
 	dtThroughputWindowDur  = dtBaseThroughputWindow
 	dtMaxSamplesPerFace    = int(dtMaxExpectedPps * dtBaseThroughputWindow.Seconds() * dtWindowSafetyFactor)
 	dtDataPacketSizeBytes  = 0
+	dtFaceInitRate         = legacyDtFaceInitRatePps
 	dtEstimatorTunableOnce sync.Once
 )
 
@@ -174,6 +177,20 @@ func dtRatePpsToMbps(ratePps float64) float64 {
 		return 0
 	}
 	return (ratePps * float64(packetBytes) * 8.0) / 1e6
+}
+
+func dtRateMbpsToPps(rateMbps float64) float64 {
+	if rateMbps <= 0 {
+		return 0
+	}
+	packetBytes := dtDataPacketSizeBytes
+	if packetBytes <= 0 {
+		packetBytes = datapacket.NewDataPacket().GetSize()
+	}
+	if packetBytes <= 0 {
+		return 0
+	}
+	return (rateMbps * 1e6) / (float64(packetBytes) * 8.0)
 }
 
 func dtSendLimitReason(ratePps float64, measuredPps float64, pending int) string {
@@ -2834,7 +2851,8 @@ func (s *Multipath) ensureDtControlActivated(
 			core.Log.Debug(s, "DT face scheduler activated",
 				"prefix", prefix,
 				"face", face,
-				"initRate", dtFaceInitRate)
+				"initRatePps", dtLogFloat1(dtFaceInitRate),
+				"initRateMbps", dtLogFloat1(dtRatePpsToMbps(dtFaceInitRate)))
 		}
 		control.mu.Unlock()
 	}
@@ -2963,6 +2981,7 @@ func initDtEstimatorTunables() {
 		if currentPktSize > 0 {
 			dtDataPacketSizeBytes = currentPktSize
 		}
+		dtFaceInitRate = math.Max(1.0, dtRateMbpsToPps(targetDtFaceInitMbps))
 
 		// Keep DT sliding-window duration static (no chunk-size shaping).
 		dtThroughputWindowDur = dtBaseThroughputWindow
@@ -3355,8 +3374,10 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 		control.bwCapActive = true
 		core.Log.Debug(s, "DT face BW cap activated",
 			"face", upstreamFace,
-			"estimatedBW", dtLogFloat1(estimatedBWFace),
-			"initRate", dtLogFloat1(dtFaceInitRate))
+			"estimatedBW_Pps", dtLogFloat1(estimatedBWFace),
+			"estimatedBW_Mbps", dtLogFloat1(dtRatePpsToMbps(estimatedBWFace)),
+			"initRatePps", dtLogFloat1(dtFaceInitRate),
+			"initRateMbps", dtLogFloat1(dtRatePpsToMbps(dtFaceInitRate)))
 	}
 	bwCapActive := control.bwCapActive
 
