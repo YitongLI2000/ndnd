@@ -145,6 +145,8 @@ var (
 	dtDataPacketSizeBytes  = 0
 	dtFaceInitRate         = legacyDtFaceInitRatePps
 	dtEstimatorTunableOnce sync.Once
+	dtResolvedLogDir       string
+	dtLogDirOnce           sync.Once
 )
 
 type DtRateControlAction int
@@ -231,6 +233,17 @@ func dtRateActionString(action DtRateControlAction) string {
 	default:
 		return "unknown"
 	}
+}
+
+func dtFaceStatsDir() string {
+	dtLogDirOnce.Do(func() {
+		if envDir := strings.TrimSpace(os.Getenv("MARS_LOG_DIR")); envDir != "" {
+			dtResolvedLogDir = envDir
+		} else {
+			dtResolvedLogDir = dtFaceStatsCsvDir
+		}
+	})
+	return dtResolvedLogDir
 }
 
 func conditionDtDataQsf(source string, raw float64) float64 {
@@ -556,7 +569,7 @@ func (s *Multipath) getDtFaceCsvSinkLocked(control *dtFaceControlState, upstream
 		return control.csvSink
 	}
 	control.csvSink = &dtFaceCsvSink{
-		path: filepath.Join(dtFaceStatsCsvDir, nodeName+"_face"+strconv.FormatUint(upstreamFace, 10)+".csv"),
+		path: filepath.Join(dtFaceStatsDir(), nodeName+"_face"+strconv.FormatUint(upstreamFace, 10)+".csv"),
 	}
 	return control.csvSink
 }
@@ -3308,6 +3321,7 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 		control.lastSignalReady = true
 	}
 	control.mu.Unlock()
+	_ = signalReason
 
 	// Default dominant signal is data. Switch to interest only when interest is strictly larger.
 	currentQ := dataQ
@@ -3491,6 +3505,10 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 	rateGapPps := prevRate - measuredSendPps
 	sendLimit := dtSendLimitReason(prevRate, measuredSendPps, pendingFace)
 	rateAdjustPps := newRate - prevRate
+	_ = bwMbpsFace
+	_ = sendMbpsMeasured
+	_ = rateGapPps
+	_ = rateAdjustPps
 	csvAction := dtRateActionString(finalAction)
 	if frozenRound {
 		csvAction = "none"
@@ -3513,6 +3531,16 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 			threadPendingAvg[i] = float64(threadPendingSum[i]) / float64(threadVisits[i])
 		}
 	}
+	_ = roundTokensNow
+	_ = roundMintedTokens
+	_ = roundGrantedTotal
+	_ = roundUsedTotal
+	_ = roundZeroBudgetTotal
+	_ = roundEmptyBudgetTotal
+	_ = roundSendFailTotal
+	_ = roundVisitsTotal
+	_ = threadPendingAvg
+	_ = threadPendingMax
 	if starvationRounds >= dtLivenessStarvationLogThreshold {
 		core.Log.Warn(s, "DT scheduler starvation detected",
 			"face", upstreamFace,
@@ -3525,34 +3553,36 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 			"livenessForcedPackets", livenessForcedPackets)
 	}
 
-	core.Log.Debug(s, "DT rate-control round",
-		"face", upstreamFace,
-		"controlState", controlState,
-		"prefixes", prefixes,
-		"signalReason", signalReason,
-		"signalType", selectedSignal,
-		"signalQ", dtLogFloat1(currentQ),
-		"signalSlope", dtLogFloat1(queueSlope),
-		"signalInterestQ", dtLogFloat1(interestQ),
-		"signalInterestSlope", dtLogFloat1(interestSlope),
-		"signalDataQ", dtLogFloat1(dataQ),
-		"signalDataSlope", dtLogFloat1(dataSlope),
-		"bwPps", dtLogFloat1(estimatedBWFace),
-		"bwMeasuredPps", dtLogFloat1(measuredBWFace),
-		"bwSamples", bwSamplesFace,
-		"bwUpdateRule", bwUpdateRule,
-		"bwMbps", dtLogFloat1(bwMbpsFace),
-		"sendPps", dtLogFloat1(measuredSendPps),
-		"sendMbps", dtLogFloat1(sendMbpsMeasured),
-		"sendLimit", sendLimit,
-		"pendingFace", pendingFace,
-		"starvationRounds", starvationRounds,
-		"livenessForcedPackets", livenessForcedPackets,
-		"ratePrev", dtLogFloat1(prevRate),
-		"rateNew", dtLogFloat1(newRate),
-		"rateGapPps", dtLogFloat1(rateGapPps),
-		"rateAdjustPps", dtLogFloat1(rateAdjustPps),
-		"action", dtRateActionString(finalAction))
+	/*
+		core.Log.Debug(s, "DT rate-control round",
+			"face", upstreamFace,
+			"controlState", controlState,
+			"prefixes", prefixes,
+			"signalReason", signalReason,
+			"signalType", selectedSignal,
+			"signalQ", dtLogFloat1(currentQ),
+			"signalSlope", dtLogFloat1(queueSlope),
+			"signalInterestQ", dtLogFloat1(interestQ),
+			"signalInterestSlope", dtLogFloat1(interestSlope),
+			"signalDataQ", dtLogFloat1(dataQ),
+			"signalDataSlope", dtLogFloat1(dataSlope),
+			"bwPps", dtLogFloat1(estimatedBWFace),
+			"bwMeasuredPps", dtLogFloat1(measuredBWFace),
+			"bwSamples", bwSamplesFace,
+			"bwUpdateRule", bwUpdateRule,
+			"bwMbps", dtLogFloat1(bwMbpsFace),
+			"sendPps", dtLogFloat1(measuredSendPps),
+			"sendMbps", dtLogFloat1(sendMbpsMeasured),
+			"sendLimit", sendLimit,
+			"pendingFace", pendingFace,
+			"starvationRounds", starvationRounds,
+			"livenessForcedPackets", livenessForcedPackets,
+			"ratePrev", dtLogFloat1(prevRate),
+			"rateNew", dtLogFloat1(newRate),
+			"rateGapPps", dtLogFloat1(rateGapPps),
+			"rateAdjustPps", dtLogFloat1(rateAdjustPps),
+			"action", dtRateActionString(finalAction))
+	*/
 	s.writeDtFaceCsvRound(
 		csvSink,
 		roundNow,
@@ -3569,28 +3599,30 @@ func (s *Multipath) faceSendRateEstimationCore(upstreamFace uint64) {
 		newRate,
 	)
 	if sendLimit == "scheduler-limited" {
-		core.Log.Debug(s, "DT scheduler round",
-			"face", upstreamFace,
-			"period", control.period,
-			"ratePrev", dtLogFloat1(prevRate),
-			"sendPps", dtLogFloat1(measuredSendPps),
-			"pendingFace", pendingFace,
-			"tokensNow", dtLogFloat1(roundTokensNow),
-			"mintedTokens", dtLogFloat1(roundMintedTokens),
-			"grantedPackets", roundGrantedTotal,
-			"usedPackets", roundUsedTotal,
-			"unusedGrantedPackets", roundGrantedTotal-roundUsedTotal,
-			"zeroBudgetTicks", roundZeroBudgetTotal,
-			"emptyBudgetPackets", roundEmptyBudgetTotal,
-			"sendFailPackets", roundSendFailTotal,
-			"threadVisits", threadVisits,
-			"threadGranted", threadGranted,
-			"threadUsed", threadUsed,
-			"threadZeroBudgetTicks", threadZeroBudget,
-			"threadEmptyBudgetPackets", threadEmptyBudget,
-			"threadSendFailPackets", threadSendFail,
-			"threadPendingAvg", threadPendingAvg,
-			"threadPendingMax", threadPendingMax)
+		/*
+			core.Log.Debug(s, "DT scheduler round",
+				"face", upstreamFace,
+				"period", control.period,
+				"ratePrev", dtLogFloat1(prevRate),
+				"sendPps", dtLogFloat1(measuredSendPps),
+				"pendingFace", pendingFace,
+				"tokensNow", dtLogFloat1(roundTokensNow),
+				"mintedTokens", dtLogFloat1(roundMintedTokens),
+				"grantedPackets", roundGrantedTotal,
+				"usedPackets", roundUsedTotal,
+				"unusedGrantedPackets", roundGrantedTotal-roundUsedTotal,
+				"zeroBudgetTicks", roundZeroBudgetTotal,
+				"emptyBudgetPackets", roundEmptyBudgetTotal,
+				"sendFailPackets", roundSendFailTotal,
+				"threadVisits", threadVisits,
+				"threadGranted", threadGranted,
+				"threadUsed", threadUsed,
+				"threadZeroBudgetTicks", threadZeroBudget,
+				"threadEmptyBudgetPackets", threadEmptyBudget,
+				"threadSendFailPackets", threadSendFail,
+				"threadPendingAvg", threadPendingAvg,
+				"threadPendingMax", threadPendingMax)
+		*/
 	}
 }
 

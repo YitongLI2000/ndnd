@@ -141,12 +141,16 @@ const (
 )
 
 const consumerStatsCsvDir = "std/examples/mars/logs"
+const consumerThroughputSampleInterval = 50 * time.Millisecond
+const consumerThroughputSampleInterval100 = 100 * time.Millisecond
 
 var (
-	MAX_PACKETS           = baseMaxPackets
-	DT_INIT_RATE          = legacyDtInitRatePps
-	THROUGHPUT_WINDOW_DUR = baseThroughputWindow
-	RC_MIN_RATE           = legacyDtMinRatePps
+	MAX_PACKETS            = baseMaxPackets
+	DT_INIT_RATE           = legacyDtInitRatePps
+	THROUGHPUT_WINDOW_DUR  = baseThroughputWindow
+	RC_MIN_RATE            = legacyDtMinRatePps
+	consumerResolvedLogDir string
+	consumerLogDirOnce     sync.Once
 )
 
 // --- Asynchronous Workload Settings ---
@@ -262,6 +266,14 @@ type flowCsvSink struct {
 	headerWritten bool
 }
 
+type nodeThroughputCsvSink struct {
+	mu            sync.Mutex
+	path          string
+	file          *os.File
+	writer        *csv.Writer
+	headerWritten bool
+}
+
 type FlowContext struct {
 	mu       sync.Mutex
 	Prefix   string
@@ -277,6 +289,9 @@ type FlowContext struct {
 	pktsReceivedTotal int
 	startTime         time.Time
 	endTime           time.Time
+	p95Time           time.Time
+	p99Time           time.Time
+	p100Time          time.Time
 	isFinished        bool
 	doneCh            chan struct{}
 
@@ -336,6 +351,26 @@ type FlowContext struct {
 	csvSink     *flowCsvSink
 }
 
+type FlowProgressSnapshot struct {
+	Prefix     string
+	Mode       TransmissionMode
+	StartTime  time.Time
+	TotalBytes int64
+	PktsRecv   int
+	IsFinished bool
+}
+
+type FlowFinalStats struct {
+	ThroughputMbps float64
+	TotalBytes     int64
+	Duration       float64
+	FCT95          float64
+	FCT99          float64
+	FCT100         float64
+}
+
+var nodeThroughputSinks = make(map[time.Duration]*nodeThroughputCsvSink)
+
 func NewFlowContext(prefix string) *FlowContext {
 	now := time.Now()
 
@@ -383,6 +418,9 @@ func (f *FlowContext) initDTState() {
 	f.endTime = now
 	f.totalBytes = 0
 	f.pktsReceivedTotal = 0
+	f.p95Time = time.Time{}
+	f.p99Time = time.Time{}
+	f.p100Time = time.Time{}
 	f.isFinished = false
 	f.pendingSends = make(map[string]PendingSend)
 	f.retxQueue = make([]int, 0)
@@ -436,6 +474,17 @@ func flowPrefixCsvLabel(prefix string) string {
 	return label
 }
 
+func consumerStatsDir() string {
+	consumerLogDirOnce.Do(func() {
+		if envDir := strings.TrimSpace(os.Getenv("MARS_LOG_DIR")); envDir != "" {
+			consumerResolvedLogDir = envDir
+		} else {
+			consumerResolvedLogDir = consumerStatsCsvDir
+		}
+	})
+	return consumerResolvedLogDir
+}
+
 func (f *FlowContext) getFlowCsvSink() *flowCsvSink {
 	if consumerNodeName == "" {
 		return nil
@@ -444,9 +493,24 @@ func (f *FlowContext) getFlowCsvSink() *flowCsvSink {
 		return f.csvSink
 	}
 	f.csvSink = &flowCsvSink{
-		path: filepath.Join(consumerStatsCsvDir, consumerNodeName+"_"+flowPrefixCsvLabel(f.Prefix)+".csv"),
+		path: filepath.Join(consumerStatsDir(), consumerNodeName+"_"+flowPrefixCsvLabel(f.Prefix)+".csv"),
 	}
 	return f.csvSink
+}
+
+func getNodeThroughputCsvSink(sampleInterval time.Duration) *nodeThroughputCsvSink {
+	if consumerNodeName == "" {
+		return nil
+	}
+	if sink, ok := nodeThroughputSinks[sampleInterval]; ok {
+		return sink
+	}
+	sampleLabel := strconv.FormatInt(sampleInterval.Milliseconds(), 10)
+	sink := &nodeThroughputCsvSink{
+		path: filepath.Join(consumerStatsDir(), consumerNodeName+"_throughput_"+sampleLabel+"ms.csv"),
+	}
+	nodeThroughputSinks[sampleInterval] = sink
+	return sink
 }
 
 func consumerCsvFloat(v float64) string {
@@ -460,6 +524,31 @@ func consumerElapsedMs(now time.Time) float64 {
 		consumerCsvStart = now
 	}
 	return now.Sub(consumerCsvStart).Seconds() * 1000.0
+}
+
+func consumerMilestoneTarget(totalPackets int, ratio float64) int {
+	if totalPackets <= 0 {
+		return 0
+	}
+	target := int(math.Ceil(float64(totalPackets) * ratio))
+	if target < 1 {
+		target = 1
+	}
+	if target > totalPackets {
+		target = totalPackets
+	}
+	return target
+}
+
+func consumerDurationSeconds(start time.Time, end time.Time) float64 {
+	if start.IsZero() || end.IsZero() {
+		return 0
+	}
+	duration := end.Sub(start).Seconds()
+	if duration < 0 {
+		return 0
+	}
+	return duration
 }
 
 func ratePpsToMbps(ratePps float64, payloadBytes float64) float64 {
@@ -577,6 +666,19 @@ func (f *FlowContext) updatePDBaseName(tier int) {
 	n = n.Append(enc.NewStringComponent(0x08, "pd"))
 	n = n.Append(enc.NewStringComponent(0x08, strconv.Itoa(tier)))
 	f.baseName = n
+}
+
+func (f *FlowContext) SnapshotProgress() FlowProgressSnapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return FlowProgressSnapshot{
+		Prefix:     f.Prefix,
+		Mode:       f.Mode,
+		StartTime:  f.startTime,
+		TotalBytes: f.totalBytes,
+		PktsRecv:   f.pktsReceivedTotal,
+		IsFinished: f.isFinished,
+	}
 }
 
 func (f *FlowContext) GetRate() float64 {
@@ -821,6 +923,15 @@ func (f *FlowContext) OnData(payload []byte, dataName string, receiveTime time.T
 		f.endTime = receiveTime
 		f.totalBytes += int64(len(payload))
 		f.pktsReceivedTotal++
+		if f.p95Time.IsZero() && f.pktsReceivedTotal >= consumerMilestoneTarget(MAX_PACKETS, 0.95) {
+			f.p95Time = receiveTime
+		}
+		if f.p99Time.IsZero() && f.pktsReceivedTotal >= consumerMilestoneTarget(MAX_PACKETS, 0.99) {
+			f.p99Time = receiveTime
+		}
+		if f.p100Time.IsZero() && f.pktsReceivedTotal >= MAX_PACKETS {
+			f.p100Time = receiveTime
+		}
 
 		if f.pktsReceivedTotal >= MAX_PACKETS {
 			f.isFinished = true
@@ -969,26 +1080,31 @@ func (f *FlowContext) runPeriodicRateControl(now time.Time) {
 
 	if len(f.window) == 0 && f.lastQsfObservationOk {
 		currentQ, queueSlope, selectedSignal, interestQ, interestSlope, dataQ, _ := f.computeDominantQsfSignal(now)
+		_ = currentQ
+		_ = queueSlope
+		_ = selectedSignal
 		rule := "no-qsf-sample-retain"
 		f.lastBWUpdateRule = rule
 		oldRate := f.currentRate
 		f.lastRateUpdate = now
-		log.Debug(consumerTag, "Rate Control Frozen",
-			"mode", consumerRateControlModeString(),
-			"prefix", f.Prefix,
-			"qsfSignal", selectedSignal,
-			"qsfAvg", consumerLogFloat1(currentQ),
-			"qsfSlope", consumerLogFloat1(queueSlope),
-			"interestQsfAvg", consumerLogFloat1(interestQ),
-			"interestQsfSlope", consumerLogFloat1(interestSlope),
-			"dataQsfAvg", consumerLogFloat1(dataQ),
-			"prevTargetRate", consumerLogFloat1(oldRate),
-			"actualRatePrevInterval", consumerLogFloat1(actualRate),
-			"nextTargetRate", consumerLogFloat1(f.currentRate),
-			"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
-			"bwUpdateRule", rule,
-			"bwSamples", f.bwSampleCountFromWindow(),
-			"action", "frozen-no-qsf-samples")
+		/*
+			log.Debug(consumerTag, "Rate Control Frozen",
+				"mode", consumerRateControlModeString(),
+				"prefix", f.Prefix,
+				"qsfSignal", selectedSignal,
+				"qsfAvg", consumerLogFloat1(currentQ),
+				"qsfSlope", consumerLogFloat1(queueSlope),
+				"interestQsfAvg", consumerLogFloat1(interestQ),
+				"interestQsfSlope", consumerLogFloat1(interestSlope),
+				"dataQsfAvg", consumerLogFloat1(dataQ),
+				"prevTargetRate", consumerLogFloat1(oldRate),
+				"actualRatePrevInterval", consumerLogFloat1(actualRate),
+				"nextTargetRate", consumerLogFloat1(f.currentRate),
+				"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
+				"bwUpdateRule", rule,
+				"bwSamples", f.bwSampleCountFromWindow(),
+				"action", "frozen-no-qsf-samples")
+		*/
 		f.writeRateControlCsv(
 			now,
 			interestQ,
@@ -1335,19 +1451,24 @@ func (f *FlowContext) updateDelayRateControl(receiveTime time.Time, actualRate f
 	f.lastRateUpdate = receiveTime
 	avgPayloadBytes := f.windowPayloadAvgBytes()
 	estimatedBWMbps := (f.estimatedBandwidth * avgPayloadBytes * 8.0) / 1e6
+	_ = measuredPPS
+	_ = bwUpdateRule
+	_ = estimatedBWMbps
 
-	log.Debug(consumerTag, "Rate Adjusted",
-		"mode", "delay",
-		"prefix", f.Prefix,
-		"prevTargetRate", consumerLogFloat1(oldRate),
-		"actualRatePrevInterval", consumerLogFloat1(actualRate),
-		"nextTargetRate", consumerLogFloat1(f.currentRate),
-		"measuredPPS", consumerLogFloat1(measuredPPS),
-		"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
-		"estimatedBWMbps", consumerLogFloat1(estimatedBWMbps),
-		"bwUpdateRule", bwUpdateRule,
-		"baseRTT", consumerLogFloat1(f.baseRTT),
-		"latestRTT", consumerLogFloat1(avgWinRTT))
+	/*
+		log.Debug(consumerTag, "Rate Adjusted",
+			"mode", "delay",
+			"prefix", f.Prefix,
+			"prevTargetRate", consumerLogFloat1(oldRate),
+			"actualRatePrevInterval", consumerLogFloat1(actualRate),
+			"nextTargetRate", consumerLogFloat1(f.currentRate),
+			"measuredPPS", consumerLogFloat1(measuredPPS),
+			"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
+			"estimatedBWMbps", consumerLogFloat1(estimatedBWMbps),
+			"bwUpdateRule", bwUpdateRule,
+			"baseRTT", consumerLogFloat1(f.baseRTT),
+			"latestRTT", consumerLogFloat1(avgWinRTT))
+	*/
 	f.writeRateControlCsv(
 		receiveTime,
 		interestQ,
@@ -1433,25 +1554,35 @@ func (f *FlowContext) updateQsfRateControl(receiveTime time.Time, actualRate flo
 	f.lastRateUpdate = receiveTime
 	avgPayloadBytes := f.windowPayloadAvgBytes()
 	estimatedBWMbps := (f.estimatedBandwidth * avgPayloadBytes * 8.0) / 1e6
+	_ = selectedSignal
+	_ = interestQ
+	_ = interestSlope
+	_ = dataSlope
+	_ = measuredPPS
+	_ = bwUpdateRule
+	_ = estimatedBWMbps
+	_ = action
 
-	log.Debug(consumerTag, "Rate Adjusted",
-		"mode", "qsf",
-		"prefix", f.Prefix,
-		"qsfSignal", selectedSignal,
-		"qsfAvg", consumerLogFloat1(currentQ),
-		"qsfSlope", consumerLogFloat1(queueSlope),
-		"interestQsfAvg", consumerLogFloat1(interestQ),
-		"interestQsfSlope", consumerLogFloat1(interestSlope),
-		"dataQsfAvg", consumerLogFloat1(dataQ),
-		"dataQsfSlope", consumerLogFloat1(dataSlope),
-		"prevTargetRate", consumerLogFloat1(oldRate),
-		"actualRatePrevInterval", consumerLogFloat1(actualRate),
-		"nextTargetRate", consumerLogFloat1(f.currentRate),
-		"measuredPPS", consumerLogFloat1(measuredPPS),
-		"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
-		"estimatedBWMbps", consumerLogFloat1(estimatedBWMbps),
-		"bwUpdateRule", bwUpdateRule,
-		"action", consumerQsfActionString(action))
+	/*
+		log.Debug(consumerTag, "Rate Adjusted",
+			"mode", "qsf",
+			"prefix", f.Prefix,
+			"qsfSignal", selectedSignal,
+			"qsfAvg", consumerLogFloat1(currentQ),
+			"qsfSlope", consumerLogFloat1(queueSlope),
+			"interestQsfAvg", consumerLogFloat1(interestQ),
+			"interestQsfSlope", consumerLogFloat1(interestSlope),
+			"dataQsfAvg", consumerLogFloat1(dataQ),
+			"dataQsfSlope", consumerLogFloat1(dataSlope),
+			"prevTargetRate", consumerLogFloat1(oldRate),
+			"actualRatePrevInterval", consumerLogFloat1(actualRate),
+			"nextTargetRate", consumerLogFloat1(f.currentRate),
+			"measuredPPS", consumerLogFloat1(measuredPPS),
+			"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
+			"estimatedBWMbps", consumerLogFloat1(estimatedBWMbps),
+			"bwUpdateRule", bwUpdateRule,
+			"action", consumerQsfActionString(action))
+	*/
 	f.writeRateControlCsv(
 		receiveTime,
 		currentQ,
@@ -1584,15 +1715,137 @@ func (f *FlowContext) updateBandwidthEstimate(now time.Time, queuePressureQsf fl
 	return rule
 }
 
-func (f *FlowContext) GetFinalStats() (float64, int64, float64) {
+func (f *FlowContext) GetFinalStats() FlowFinalStats {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	duration := f.endTime.Sub(f.startTime).Seconds()
-	if duration <= 0 {
-		return 0.0, f.totalBytes, 0.0
+	duration := consumerDurationSeconds(f.startTime, f.endTime)
+	throughputMbps := 0.0
+	if duration > 0 {
+		throughputMbps = (float64(f.totalBytes) * 8.0) / (duration * 1e6)
 	}
-	throughputMbps := (float64(f.totalBytes) * 8.0) / (duration * 1e6)
-	return throughputMbps, f.totalBytes, duration
+	p95 := consumerDurationSeconds(f.startTime, f.p95Time)
+	p99 := consumerDurationSeconds(f.startTime, f.p99Time)
+	p100 := consumerDurationSeconds(f.startTime, f.p100Time)
+	if p100 <= 0 {
+		p100 = duration
+	}
+	return FlowFinalStats{
+		ThroughputMbps: throughputMbps,
+		TotalBytes:     f.totalBytes,
+		Duration:       duration,
+		FCT95:          p95,
+		FCT99:          p99,
+		FCT100:         p100,
+	}
+}
+
+func closeNodeThroughputCsvSinks() {
+	for _, sink := range nodeThroughputSinks {
+		if sink == nil {
+			continue
+		}
+		sink.mu.Lock()
+		if sink.writer != nil {
+			sink.writer.Flush()
+		}
+		if sink.file != nil {
+			_ = sink.file.Close()
+			sink.file = nil
+		}
+		sink.mu.Unlock()
+	}
+}
+
+func writeNodeThroughputCsvRow(now time.Time, flowContexts []*FlowContext, throughputs map[string]float64, sampleInterval time.Duration) {
+	sink := getNodeThroughputCsvSink(sampleInterval)
+	if sink == nil {
+		return
+	}
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+
+	if sink.writer == nil {
+		if err := os.MkdirAll(filepath.Dir(sink.path), 0o755); err != nil {
+			log.Warn(consumerTag, "Failed to create node throughput CSV directory", "path", sink.path, "err", err)
+			return
+		}
+		file, err := os.OpenFile(sink.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			log.Warn(consumerTag, "Failed to open node throughput CSV", "path", sink.path, "err", err)
+			return
+		}
+		sink.file = file
+		sink.writer = csv.NewWriter(file)
+	}
+
+	if !sink.headerWritten {
+		header := []string{"time_ms"}
+		for _, flowCtx := range flowContexts {
+			header = append(header, flowPrefixCsvLabel(flowCtx.Prefix)+"_throughput_mbps")
+		}
+		if err := sink.writer.Write(header); err != nil {
+			log.Warn(consumerTag, "Failed to write node throughput CSV header", "path", sink.path, "err", err)
+			return
+		}
+		sink.headerWritten = true
+	}
+
+	row := []string{consumerCsvFloat(consumerElapsedMs(now))}
+	for _, flowCtx := range flowContexts {
+		row = append(row, consumerCsvFloat(throughputs[flowCtx.Prefix]))
+	}
+	if err := sink.writer.Write(row); err != nil {
+		log.Warn(consumerTag, "Failed to write node throughput CSV row", "path", sink.path, "err", err)
+		return
+	}
+	sink.writer.Flush()
+	if err := sink.writer.Error(); err != nil {
+		log.Warn(consumerTag, "Failed to flush node throughput CSV", "path", sink.path, "err", err)
+	}
+}
+
+func runNodeThroughputSampler(flowContexts []*FlowContext, stopCh <-chan struct{}, sampleInterval time.Duration) {
+	ticker := time.NewTicker(sampleInterval)
+	defer ticker.Stop()
+
+	prevBytes := make(map[string]int64, len(flowContexts))
+	prevStart := make(map[string]time.Time, len(flowContexts))
+	prevSampleTime := time.Time{}
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		case tickNow := <-ticker.C:
+			throughputs := make(map[string]float64, len(flowContexts))
+			elapsed := 0.0
+			if !prevSampleTime.IsZero() {
+				elapsed = tickNow.Sub(prevSampleTime).Seconds()
+			}
+
+			for _, flowCtx := range flowContexts {
+				snapshot := flowCtx.SnapshotProgress()
+				throughput := 0.0
+				if snapshot.Mode == ModeDT && !snapshot.StartTime.IsZero() {
+					prevFlowStart := prevStart[snapshot.Prefix]
+					prevFlowBytes := prevBytes[snapshot.Prefix]
+					if !prevSampleTime.IsZero() && prevFlowStart.Equal(snapshot.StartTime) && elapsed > 0 {
+						deltaBytes := snapshot.TotalBytes - prevFlowBytes
+						if deltaBytes > 0 {
+							throughput = (float64(deltaBytes) * 8.0) / (elapsed * 1e6)
+						}
+					}
+				}
+				prevBytes[snapshot.Prefix] = snapshot.TotalBytes
+				prevStart[snapshot.Prefix] = snapshot.StartTime
+				throughputs[snapshot.Prefix] = throughput
+			}
+
+			writeNodeThroughputCsvRow(tickNow, flowContexts, throughputs, sampleInterval)
+			prevSampleTime = tickNow
+		}
+	}
 }
 
 // --- Global Coordination ---
@@ -2068,6 +2321,10 @@ func main() {
 		go runFlow(app, stats, flowCtx, &wg)
 	}
 
+	throughputStopCh := make(chan struct{})
+	go runNodeThroughputSampler(flowContexts, throughputStopCh, consumerThroughputSampleInterval)
+	go runNodeThroughputSampler(flowContexts, throughputStopCh, consumerThroughputSampleInterval100)
+
 	go func() {
 		<-startDtCh
 		for _, f := range flowContexts {
@@ -2076,6 +2333,8 @@ func main() {
 	}()
 
 	wg.Wait()
+	close(throughputStopCh)
+	closeNodeThroughputCsvSinks()
 	elapsed := time.Since(startTime)
 	log.Info(consumerTag, "All flows stopped", "elapsedTime", elapsed)
 
@@ -2085,12 +2344,15 @@ func main() {
 	if initialMode == ModeDT || flowContexts[0].Mode == ModeDT {
 		log.Info(consumerTag, "=== Final Per-Flow Statistics (DT) ===")
 		for _, flowCtx := range flowContexts {
-			avgThroughput, totalBytes, duration := flowCtx.GetFinalStats()
+			finalStats := flowCtx.GetFinalStats()
 			log.Info(consumerTag, "Flow Summary",
 				"flow", flowCtx.Prefix,
-				"totalBytes", totalBytes,
-				"avgMbps", avgThroughput,
-				"duration", duration)
+				"totalBytes", finalStats.TotalBytes,
+				"avgMbps", finalStats.ThroughputMbps,
+				"duration", finalStats.Duration,
+				"fct95", finalStats.FCT95,
+				"fct99", finalStats.FCT99,
+				"fct100", finalStats.FCT100)
 		}
 	}
 }

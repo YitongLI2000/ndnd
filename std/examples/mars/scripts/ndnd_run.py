@@ -10,6 +10,7 @@ import os
 import re
 import collections
 import sys
+from datetime import datetime
 
 # ==============================================================================
 #  SCALING CONFIGURATION
@@ -31,7 +32,7 @@ NUM_PRODUCERS_PER_CONSUMER = 5
 
 # 3. Network Loss
 #    - Packet loss % on links between Consumers and Cores.
-CON_TO_CORE_LOSS = 0
+CON_TO_CORE_LOSS = 0.1
 
 # 4. Start Delays
 #    - Staggering start times to prevent initial ARP/Routing storms.
@@ -319,6 +320,21 @@ def clear_logs_dir():
     print(f"Cleared {removed_count} existing log file(s) from {logs_dir}")
     return logs_dir
 
+
+def loss_label(loss_value):
+    return f"loss_{str(loss_value).replace('.', 'p')}pct"
+
+
+def prepare_run_logs_dir():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    logs_root = os.path.join(script_dir, '..', 'logs')
+    loss_dir = os.path.join(logs_root, loss_label(CON_TO_CORE_LOSS))
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(loss_dir, timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Using run logs directory: {run_dir}")
+    return run_dir
+
 # ==============================================================================
 #  SETUP & EXECUTION
 # ==============================================================================
@@ -387,11 +403,10 @@ def warmup_network(net, allocator):
     else:
         print(f"❌ Warmup finished with {failed_links} failures.")
 
-def start_ndnd_daemons(net, allocator):
+def start_ndnd_daemons(net, allocator, logs_dir):
     print(f"\nStarting ndnd daemons on {len(NODES)} nodes...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     configs_dir = os.path.join(script_dir, '..', 'configs')
-    logs_dir = clear_logs_dir()
 
     # Always regenerate/override all configs from the current topology before daemon start.
     regenerate_all_node_configs(allocator)
@@ -402,7 +417,7 @@ def start_ndnd_daemons(net, allocator):
         log_path = os.path.join(logs_dir, f'{node_name}.log')
         node.cmd('mkdir -p /run/nfd')
         node.cmd('rm -f /run/nfd/nfd.sock') 
-        node.cmd(f'env NDN_LOG=trace ndnd daemon {config_path} > {log_path} 2>&1 &')
+        node.cmd(f'env MARS_LOG_DIR={logs_dir} NDN_LOG=trace ndnd daemon {config_path} > {log_path} 2>&1 &')
         time.sleep(0.05) 
     print("All ndnd daemons started.")
 
@@ -550,10 +565,9 @@ def verify_dynamic_routing_shape_or_die(net):
 
     print(f"✅ Dynamic routing verification passed on {con_name} (all /pro* prefixes).")
 
-def run_applications(net):
+def run_applications(net, allocator, logs_dir):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     apps_dir = os.path.join(script_dir, '..', 'apps')
-    logs_dir = os.path.join(script_dir, '..', 'logs')
     
     print("\nWaiting 45 seconds for routing convergence...")
     time.sleep(45)
@@ -577,7 +591,7 @@ def run_applications(net):
         p_log = os.path.join(logs_dir, f'{node_name}_app.log')
         app_name = f"{node_name}app"
         prefix = f"/pro{i}"
-        p_node.cmd(f'{p_bin} {app_name} {prefix} > {p_log} 2>&1 &')
+        p_node.cmd(f'env MARS_LOG_DIR={logs_dir} {p_bin} {app_name} {prefix} > {p_log} 2>&1 &')
         time.sleep(0.1)
 
     print("Waiting 5s for producers to register...")
@@ -612,7 +626,7 @@ def run_applications(net):
         # Arguments: <node_name> <producer_range>
         # TODO: debug pd mode
         # c_node.cmd(f'{c_bin} {c_name}app {range_arg} ModeDT > {c_log} 2>&1 &')
-        c_node.cmd(f'{c_bin} {c_name}app {range_arg} ModePD > {c_log} 2>&1 &')
+        c_node.cmd(f'env MARS_LOG_DIR={logs_dir} {c_bin} {c_name}app {range_arg} ModePD > {c_log} 2>&1 &')
     
     print("All applications running.")
 
@@ -677,14 +691,14 @@ if __name__ == '__main__':
     os.system('mn -c > /dev/null 2>&1')
     
     net, allocator = create_topology_and_net()
+    logs_dir = prepare_run_logs_dir()
     
     try:
         log_ip_configuration(net)
         warmup_network(net, allocator)
-        start_ndnd_daemons(net, allocator)
-        run_applications(net)
+        start_ndnd_daemons(net, allocator, logs_dir)
+        run_applications(net, allocator, logs_dir)
         if POST_RUN_MODE == "auto_exit_on_flow_summary":
-            logs_dir = os.path.join(script_dir, '..', 'logs')
             completed = wait_for_all_flow_summaries(logs_dir)
             if not completed:
                 print("Falling back to interactive CLI due to incomplete Flow Summary.")
