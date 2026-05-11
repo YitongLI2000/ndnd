@@ -101,7 +101,7 @@ type ConsumerQsfRateControlParams struct {
 	NoSampleWarnEvery time.Duration
 }
 
-const consumerRateControlMode = ConsumerRateControlQsf
+var consumerRateControlMode = ConsumerRateControlQsf
 
 var consumerQsfRateControlParams = ConsumerQsfRateControlParams{
 	MaxQueueSize:      1.0,
@@ -176,6 +176,13 @@ func rateMbpsToPps(rateMbps float64, payloadBytes float64) float64 {
 	return (rateMbps * 1e6) / (payloadBytes * 8.0)
 }
 
+func selectConsumerRateControlMode() ConsumerRateControlMode {
+	if os.Getenv("MARS_DEPLOYMENT_MODE") == "minimal" {
+		return ConsumerRateControlDelay
+	}
+	return ConsumerRateControlQsf
+}
+
 type TransmissionMode int
 
 const (
@@ -198,7 +205,7 @@ var (
 	startDtCh       chan struct{}
 )
 
-func applyAdaptiveDtTunables() {
+func applyAdaptiveDtTunables(flowCount int) {
 	currentPktSize := datapacket.NewDataPacket().GetSize()
 	if currentPktSize <= 0 {
 		log.Warn(consumerTag, "Adaptive DT tuning disabled: invalid packet size", "size", currentPktSize)
@@ -212,13 +219,21 @@ func applyAdaptiveDtTunables() {
 		return
 	}
 
-	DT_INIT_RATE = math.Max(1.0, rateMbpsToPps(targetDtInitMbps, payloadBytes))
+	effectiveInitMbps := targetDtInitMbps
+	deploymentMode := os.Getenv("MARS_DEPLOYMENT_MODE")
+	if deploymentMode == "minimal" && flowCount > 0 {
+		effectiveInitMbps = targetDtInitMbps / float64(flowCount)
+	}
+
+	DT_INIT_RATE = math.Max(1.0, rateMbpsToPps(effectiveInitMbps, payloadBytes))
 	RC_MIN_RATE = math.Max(1.0, rateMbpsToPps(targetDtMinRateMbps, payloadBytes))
 	MAX_PACKETS = int(math.Max(1.0, math.Round(float64(baseMaxPackets)*scale)))
 	// Keep DT sliding-window duration static (no chunk-size shaping).
 	THROUGHPUT_WINDOW_DUR = baseThroughputWindow
 
 	log.Info(consumerTag, "Adaptive DT tuning applied",
+		"deploymentMode", deploymentMode,
+		"flowCount", flowCount,
 		"dataPacketSizeBytes", currentPktSize,
 		"scale", scale,
 		"DT_INIT_RATE_Pps", consumerLogFloat1(DT_INIT_RATE),
@@ -1056,7 +1071,12 @@ func (f *FlowContext) updateRateControl(receiveTime time.Time, payloadSize int, 
 		return
 	}
 
-	f.updateBandwidthEstimate(receiveTime, math.Max(f.correctedInterestQsf(interestQsf), dataQsf))
+	switch consumerRateControlMode {
+	case ConsumerRateControlQsf:
+		f.updateQsfBandwidthEstimate(receiveTime, math.Max(f.correctedInterestQsf(interestQsf), dataQsf))
+	default:
+		f.updateDelayBandwidthEstimate(receiveTime)
+	}
 }
 
 func (f *FlowContext) runPeriodicRateControl(now time.Time) {
@@ -1078,12 +1098,20 @@ func (f *FlowContext) runPeriodicRateControl(now time.Time) {
 		actualRate = float64(f.interestsSentInPeriod) / timeSinceLastUpdate.Seconds()
 	}
 
-	if len(f.window) == 0 && f.lastQsfObservationOk {
-		currentQ, queueSlope, selectedSignal, interestQ, interestSlope, dataQ, _ := f.computeDominantQsfSignal(now)
-		_ = currentQ
-		_ = queueSlope
-		_ = selectedSignal
-		rule := "no-qsf-sample-retain"
+	if len(f.window) == 0 && consumerHasNoSampleObservation(f) {
+		interestQ := 0.0
+		interestSlope := 0.0
+		dataQ := 0.0
+		if consumerRateControlMode == ConsumerRateControlQsf {
+			currentQ, queueSlope, selectedSignal, qInterest, qInterestSlope, qData, _ := f.computeDominantQsfSignal(now)
+			_ = currentQ
+			_ = queueSlope
+			_ = selectedSignal
+			interestQ = qInterest
+			interestSlope = qInterestSlope
+			dataQ = qData
+		}
+		rule := consumerNoSampleRuleString()
 		f.lastBWUpdateRule = rule
 		oldRate := f.currentRate
 		f.lastRateUpdate = now
@@ -1266,6 +1294,24 @@ func consumerRateControlModeString() string {
 	}
 }
 
+func consumerHasNoSampleObservation(f *FlowContext) bool {
+	switch consumerRateControlMode {
+	case ConsumerRateControlQsf:
+		return f.lastQsfObservationOk
+	default:
+		return !f.lastRateSampleTime.IsZero()
+	}
+}
+
+func consumerNoSampleRuleString() string {
+	switch consumerRateControlMode {
+	case ConsumerRateControlQsf:
+		return "no-qsf-sample-retain"
+	default:
+		return "no-delay-sample-retain"
+	}
+}
+
 func consumerControlPeriodFromBootstrap(baseRTT float64) time.Duration {
 	if DT_USE_STATIC_CONTROL_PERIOD {
 		return DT_STATIC_CONTROL_PERIOD
@@ -1378,6 +1424,7 @@ func (f *FlowContext) checkRateControlNoFreshSamples(now time.Time) {
 	f.lastNoSampleWarn = now
 	log.Warn(consumerTag, "DT BW estimate retained without fresh samples",
 		"prefix", f.Prefix,
+		"mode", consumerRateControlModeString(),
 		"retainedBWPps", consumerLogFloat1(f.estimatedBandwidth),
 		"lastMeasuredBWPps", consumerLogFloat1(f.lastMeasuredBandwidth),
 		"lastUpdateRule", lastRule,
@@ -1393,6 +1440,17 @@ func (f *FlowContext) windowPayloadAvgBytes() float64 {
 		totalBytes += s.Size
 	}
 	return float64(totalBytes) / float64(len(f.window))
+}
+
+func (f *FlowContext) windowRTTAvg() float64 {
+	if len(f.window) == 0 {
+		return 0
+	}
+	totalRTT := 0.0
+	for _, s := range f.window {
+		totalRTT += s.RTT
+	}
+	return totalRTT / float64(len(f.window))
 }
 
 func (f *FlowContext) measuredPPSFromWindow() float64 {
@@ -1615,7 +1673,7 @@ func (f *FlowContext) computeDominantQsfSignal(now time.Time) (float64, float64,
 	return dataQ, dataSlope, "data", interestQ, interestSlope, dataQ, dataSlope
 }
 
-func (f *FlowContext) updateBandwidthEstimate(now time.Time, queuePressureQsf float64) string {
+func (f *FlowContext) updateQsfBandwidthEstimate(now time.Time, queuePressureQsf float64) string {
 	if f.adjustmentPeriod <= 0 {
 		return f.lastBWUpdateRule
 	}
@@ -1701,6 +1759,107 @@ func (f *FlowContext) updateBandwidthEstimate(now time.Time, queuePressureQsf fl
 		candidate = latest
 		alpha = consumerBwAlphaSmall
 		rule = "queue-pressure-fluctuating"
+	default:
+		rule = "retain"
+	}
+
+	if alpha > 0 {
+		f.estimatedBandwidth = prevBW + alpha*(candidate-prevBW)
+		if f.estimatedBandwidth >= DT_INIT_RATE {
+			f.bwCapEligible = true
+		}
+	}
+	f.lastBWUpdateRule = rule
+	return rule
+}
+
+func (f *FlowContext) updateDelayBandwidthEstimate(now time.Time) string {
+	if f.adjustmentPeriod <= 0 {
+		return f.lastBWUpdateRule
+	}
+
+	measuredPPS := f.measuredPPSFromWindow()
+	sampleCount := f.bwSampleCountFromWindow()
+	prevBW := f.estimatedBandwidth
+	rule := "retain"
+	f.lastMeasuredBandwidth = measuredPPS
+
+	switch {
+	case sampleCount < consumerBwSampleMin:
+		if sampleCount == 0 {
+			rule = "no-sample-retain"
+		} else if prevBW > 0 {
+			rule = "insufficient-sample-retain"
+		} else {
+			rule = "insufficient-sample-skip"
+		}
+	case measuredPPS <= 0 && prevBW > 0:
+		rule = "no-sample-retain"
+	}
+
+	if sampleCount < consumerBwSampleMin || measuredPPS <= 0 {
+		f.lastBWUpdateRule = rule
+		return rule
+	}
+
+	spacing := consumerBwObservationSpacing(f.adjustmentPeriod)
+	if !f.lastBwObservationTime.IsZero() && now.Sub(f.lastBwObservationTime) < spacing {
+		f.lastBWUpdateRule = "cadence-wait"
+		return f.lastBWUpdateRule
+	}
+
+	f.lastBwObservationTime = now
+	f.bwObservations = append(f.bwObservations, measuredPPS)
+	if len(f.bwObservations) > consumerBwObsLimit {
+		f.bwObservations = f.bwObservations[len(f.bwObservations)-consumerBwObsLimit:]
+	}
+
+	if !f.bwBootstrapReady {
+		if len(f.bwObservations) < consumerBwObsLimit {
+			f.lastBWUpdateRule = "bootstrap-collecting"
+			return f.lastBWUpdateRule
+		}
+
+		f.estimatedBandwidth = averageFloat64(f.bwObservations)
+		f.bwBootstrapReady = true
+		f.lastBWUpdateRule = "bootstrap-ready"
+		f.lastRateUpdate = now
+		f.interestsSentInPeriod = 0
+		log.Debug(consumerTag, "DT BW bootstrap ready",
+			"prefix", f.Prefix,
+			"mode", consumerRateControlModeString(),
+			"estimatedBW", consumerLogFloat1(f.estimatedBandwidth),
+			"observations", len(f.bwObservations),
+			"observationSpacing", spacing)
+		return f.lastBWUpdateRule
+	}
+
+	latest := f.bwObservations[len(f.bwObservations)-1]
+	avgRecent := averageFloat64(f.bwObservations)
+	trend := consumerBwTrend(f.bwObservations)
+	avgWinRTT := f.windowRTTAvg()
+	triggerUp := measuredPPS > prevBW
+	triggerDelay := f.baseRTT > 0 && avgWinRTT >= RC_RTT_HIGH_THRESH_MULT*f.baseRTT
+	candidate := prevBW
+	alpha := 0.0
+
+	switch {
+	case triggerUp && trend == bwTrendIncreasing:
+		candidate = avgRecent
+		alpha = consumerBwAlphaUp
+		rule = "throughput-high-monotonic"
+	case triggerUp:
+		candidate = latest
+		alpha = consumerBwAlphaSmall
+		rule = "throughput-high-fluctuating"
+	case triggerDelay && trend == bwTrendDecreasing:
+		candidate = latest
+		alpha = consumerBwAlphaDown
+		rule = "delay-pressure-monotonic"
+	case triggerDelay:
+		candidate = latest
+		alpha = consumerBwAlphaSmall
+		rule = "delay-pressure-fluctuating"
 	default:
 		rule = "retain"
 	}
@@ -2274,13 +2433,14 @@ func main() {
 		}
 	}
 
-	applyAdaptiveDtTunables()
-
 	targetPrefixes, err := parseProducerRange(rangeStr)
 	if err != nil {
 		log.Fatal(consumerTag, "Failed to parse producer range", "err", err)
 		return
 	}
+
+	consumerRateControlMode = selectConsumerRateControlMode()
+	applyAdaptiveDtTunables(len(targetPrefixes))
 
 	//! Change the log level of consumer
 	log.Default().SetLevel(log.LevelDebug)
@@ -2305,7 +2465,9 @@ func main() {
 		"nodeName", nodeName,
 		"index", consumerIndex,
 		"targets", len(targetPrefixes),
-		"initialMode", initialMode)
+		"initialMode", initialMode,
+		"rateControlMode", consumerRateControlModeString(),
+		"deploymentMode", os.Getenv("MARS_DEPLOYMENT_MODE"))
 
 	pdTotalFlows = len(targetPrefixes)
 	startDtCh = make(chan struct{})

@@ -121,7 +121,9 @@ const (
 	// Link-service queue capacity used when DT metadata sources the ndnd send queue.
 	dtLinkServiceQueueCapacityPackets = 20.0
 	// DataQsf source for outgoing DT metadata: "qdisc", "transport", or "link-service".
-	dtDataQsfSource = "qdisc"
+	dtDataQsfSource          = "qdisc"
+	dtFailureModeNormal      = "normal"
+	dtFailureModeFaceDisable = "face-disable"
 )
 
 var dtRateControlParams = DtRateControlParams{
@@ -147,6 +149,10 @@ var (
 	dtEstimatorTunableOnce sync.Once
 	dtResolvedLogDir       string
 	dtLogDirOnce           sync.Once
+	dtFailureConfigOnce    sync.Once
+	dtResolvedFailureCfg   dtFailureConfig
+	dtFailureNodeOnce      sync.Once
+	dtResolvedFailureNode  *dtFailureNodeState
 )
 
 type DtRateControlAction int
@@ -410,6 +416,34 @@ type dtFaceCsvSink struct {
 	headerWritten bool
 }
 
+type dtFailureConfig struct {
+	Enabled          bool
+	Mode             string
+	StartOffset      time.Duration
+	EndOffset        time.Duration
+	ExpectedPrefixes int
+}
+
+type dtFailureNodeState struct {
+	mu                sync.Mutex
+	convergedPrefixes map[string]bool
+	candidateFaces    map[uint64]bool
+	armed             bool
+	active            bool
+	recovered         bool
+	startTime         time.Time
+	endTime           time.Time
+	failedFace        uint64
+	activationEpoch   uint64
+}
+
+type dtFailureSnapshot struct {
+	Enabled         bool
+	Active          bool
+	FailedFace      uint64
+	ActivationEpoch uint64
+}
+
 type dtLocalPrefixQueue struct {
 	prefix string
 	queue  []*InterestQueueItem
@@ -496,14 +530,15 @@ var dtFaceCsvStart time.Time
 // Multipath Strategy Struct
 type Multipath struct {
 	StrategyBase
-	dtExecByFace        map[uint64]*dtThreadFaceExecState
-	dtQueuesByPrefix    map[string]*dtLocalPrefixQueue
-	dtAssignByPrefix    map[string]*dtPrefixFaceAssignState
-	dtLocalFacePrefixes map[uint64][]string
-	dtLocalFaceKnown    map[uint64]map[string]bool
-	dtLocalFaceOrder    []uint64
-	dtLocalFaceSeen     map[uint64]bool
-	dtLocalFaceRR       uint64
+	dtExecByFace          map[uint64]*dtThreadFaceExecState
+	dtQueuesByPrefix      map[string]*dtLocalPrefixQueue
+	dtAssignByPrefix      map[string]*dtPrefixFaceAssignState
+	dtLocalFacePrefixes   map[uint64][]string
+	dtLocalFaceKnown      map[uint64]map[string]bool
+	dtLocalFaceOrder      []uint64
+	dtLocalFaceSeen       map[uint64]bool
+	dtLocalFaceRR         uint64
+	dtFailureAppliedEpoch uint64
 }
 
 func init() {
@@ -558,6 +593,242 @@ func (s *Multipath) AfterContentStoreHit(packet *defn.Pkt, pitEntry table.PitEnt
 
 func (s *Multipath) dtNodeNameNormalized() string {
 	return strings.TrimPrefix(s.StrategyNodeName.String(), "/")
+}
+
+func getDtFailureConfig() dtFailureConfig {
+	dtFailureConfigOnce.Do(func() {
+		cfg := dtFailureConfig{
+			Mode:             dtFailureModeNormal,
+			ExpectedPrefixes: 5,
+		}
+		mode := strings.TrimSpace(os.Getenv("MARS_FAILURE_MODE"))
+		if mode == "" {
+			dtResolvedFailureCfg = cfg
+			return
+		}
+		cfg.Mode = mode
+		cfg.Enabled = mode == dtFailureModeFaceDisable
+		if startMs, err := strconv.Atoi(strings.TrimSpace(os.Getenv("MARS_FAILURE_START_MS"))); err == nil && startMs >= 0 {
+			cfg.StartOffset = time.Duration(startMs) * time.Millisecond
+		}
+		if endMs, err := strconv.Atoi(strings.TrimSpace(os.Getenv("MARS_FAILURE_END_MS"))); err == nil && endMs > 0 {
+			cfg.EndOffset = time.Duration(endMs) * time.Millisecond
+		}
+		if prefixes, err := strconv.Atoi(strings.TrimSpace(os.Getenv("MARS_FAILURE_PREFIX_COUNT"))); err == nil && prefixes > 0 {
+			cfg.ExpectedPrefixes = prefixes
+		}
+		if cfg.EndOffset <= cfg.StartOffset {
+			cfg.Enabled = false
+		}
+		dtResolvedFailureCfg = cfg
+	})
+	return dtResolvedFailureCfg
+}
+
+func getDtFailureNodeState() *dtFailureNodeState {
+	dtFailureNodeOnce.Do(func() {
+		dtResolvedFailureNode = &dtFailureNodeState{
+			convergedPrefixes: make(map[string]bool),
+			candidateFaces:    make(map[uint64]bool),
+		}
+	})
+	return dtResolvedFailureNode
+}
+
+func dtFailureEligibleNode(nodeName string) bool {
+	return strings.HasPrefix(nodeName, "con")
+}
+
+func dtFilterFacesWithoutFailure(candidateFaces []uint64, blockedFace uint64) []uint64 {
+	if blockedFace == 0 || len(candidateFaces) == 0 {
+		return append([]uint64(nil), candidateFaces...)
+	}
+	filtered := make([]uint64, 0, len(candidateFaces))
+	for _, face := range candidateFaces {
+		if face == blockedFace {
+			continue
+		}
+		filtered = append(filtered, face)
+	}
+	return filtered
+}
+
+func dtSortedFaceKeys(faceSet map[uint64]bool) []uint64 {
+	faces := make([]uint64, 0, len(faceSet))
+	for face := range faceSet {
+		faces = append(faces, face)
+	}
+	sort.Slice(faces, func(i, j int) bool {
+		return faces[i] < faces[j]
+	})
+	return faces
+}
+
+func (s *Multipath) armDtFailureAfterPdConvergence(info *PathDiscoveryInfo, now time.Time) {
+	cfg := getDtFailureConfig()
+	nodeName := s.dtNodeNameNormalized()
+	if !cfg.Enabled || !dtFailureEligibleNode(nodeName) {
+		return
+	}
+
+	state := getDtFailureNodeState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.armed || state.recovered {
+		return
+	}
+	state.convergedPrefixes[info.Prefix] = true
+	for _, face := range info.DtValidFaces {
+		state.candidateFaces[face] = true
+	}
+	if len(state.convergedPrefixes) < cfg.ExpectedPrefixes {
+		return
+	}
+
+	faces := dtSortedFaceKeys(state.candidateFaces)
+	if len(faces) <= 1 {
+		state.recovered = true
+		core.Log.Warn(s, "DT face failure skipped: not enough distinct valid faces",
+			"node", nodeName,
+			"prefixes", len(state.convergedPrefixes),
+			"candidateFaces", faces)
+		return
+	}
+
+	state.failedFace = faces[0]
+	state.startTime = now.Add(cfg.StartOffset)
+	state.endTime = now.Add(cfg.EndOffset)
+	state.armed = true
+	core.Log.Info(s, "DT face failure armed",
+		"node", nodeName,
+		"failedFace", state.failedFace,
+		"startIn", cfg.StartOffset,
+		"endIn", cfg.EndOffset,
+		"prefixes", len(state.convergedPrefixes),
+		"candidateFaces", faces)
+}
+
+func (s *Multipath) dtFailureSnapshot(now time.Time) dtFailureSnapshot {
+	cfg := getDtFailureConfig()
+	nodeName := s.dtNodeNameNormalized()
+	if !cfg.Enabled || !dtFailureEligibleNode(nodeName) {
+		return dtFailureSnapshot{}
+	}
+
+	state := getDtFailureNodeState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	snapshot := dtFailureSnapshot{
+		Enabled:    state.armed && state.failedFace != 0,
+		FailedFace: state.failedFace,
+	}
+	if !snapshot.Enabled {
+		return snapshot
+	}
+
+	if state.active && !now.Before(state.endTime) {
+		state.active = false
+		state.recovered = true
+		core.Log.Info(s, "DT face failure recovered",
+			"node", nodeName,
+			"face", state.failedFace,
+			"at", now)
+	}
+
+	if !state.active && !state.recovered && !now.Before(state.startTime) && now.Before(state.endTime) {
+		state.active = true
+		state.activationEpoch++
+		core.Log.Warn(s, "DT face failure started",
+			"node", nodeName,
+			"face", state.failedFace,
+			"windowEnd", state.endTime)
+	}
+
+	snapshot.Active = state.active
+	snapshot.ActivationEpoch = state.activationEpoch
+	return snapshot
+}
+
+func (s *Multipath) dtBlockedFace(now time.Time, upstreamFace uint64) bool {
+	snapshot := s.dtFailureSnapshot(now)
+	return snapshot.Active && snapshot.FailedFace == upstreamFace
+}
+
+func (s *Multipath) blockedFaceFallbackCandidates(prefix string, blockedFace uint64) []uint64 {
+	info := s.getPathDiscoveryInfo(prefix)
+	info.mu.Lock()
+	defer info.mu.Unlock()
+	return dtFilterFacesWithoutFailure(info.DtValidFaces, blockedFace)
+}
+
+func (s *Multipath) reassignLocalDtInterestsFromFailedFace(blockedFace uint64) int {
+	if blockedFace == 0 {
+		return 0
+	}
+
+	reassigned := 0
+	for prefix, queueState := range s.dtQueuesByPrefix {
+		if queueState == nil || len(queueState.queue) == 0 {
+			continue
+		}
+		for _, item := range queueState.queue {
+			if item == nil || item.OwnerThreadID != s.threadID || item.AssignedFace != blockedFace {
+				continue
+			}
+
+			survivors := dtFilterFacesWithoutFailure(item.CandidateFaces, blockedFace)
+			if len(survivors) == 0 {
+				survivors = s.blockedFaceFallbackCandidates(prefix, blockedFace)
+			}
+			if len(survivors) == 0 {
+				continue
+			}
+
+			newFace := s.selectDtAssignedFaceWRR(prefix, survivors)
+			if newFace == 0 {
+				continue
+			}
+
+			noteDtThreadDemand(blockedFace, s.threadID, -1)
+			noteDtThreadDemand(newFace, s.threadID, 1)
+			s.noteLocalPrefixEligibleForFace(newFace, prefix)
+			item.CandidateFaces = append([]uint64(nil), survivors...)
+			item.AssignedFace = newFace
+			reassigned++
+		}
+	}
+
+	return reassigned
+}
+
+func (s *Multipath) syncDtFailureState(now time.Time) dtFailureSnapshot {
+	snapshot := s.dtFailureSnapshot(now)
+	if snapshot.Active && snapshot.ActivationEpoch != 0 && snapshot.ActivationEpoch != s.dtFailureAppliedEpoch {
+		reassigned := s.reassignLocalDtInterestsFromFailedFace(snapshot.FailedFace)
+		s.dtFailureAppliedEpoch = snapshot.ActivationEpoch
+		core.Log.Info(s, "DT face failure local reassignment complete",
+			"thread", s.threadID,
+			"face", snapshot.FailedFace,
+			"reassigned", reassigned,
+			"activationEpoch", snapshot.ActivationEpoch)
+	}
+	return snapshot
+}
+
+func clearDtFaceBlockedStateLocked(control *dtFaceControlState, now time.Time) {
+	control.tokens = 0
+	control.lastRefill = now
+	control.livenessForcedPackets = 0
+	control.starvationZeroSendRounds = 0
+	control.roundMintedTokens = 0
+	for i := range control.budgetByThread {
+		control.budgetByThread[i] = 0
+	}
+	for i := range control.carryByThread {
+		control.carryByThread[i] = 0
+	}
 }
 
 func (s *Multipath) getDtFaceCsvSinkLocked(control *dtFaceControlState, upstreamFace uint64) *dtFaceCsvSink {
@@ -837,7 +1108,9 @@ func (s *Multipath) handleDataTransmissionInterest(
 	inFace uint64,
 	nexthops []*table.FibNextHopEntry,
 ) {
-	noteDtFaceCsvStart(time.Now())
+	now := time.Now()
+	noteDtFaceCsvStart(now)
+	failureSnapshot := s.syncDtFailureState(now)
 
 	// Extract sequence number from interest name for sparse DT telemetry.
 	interestName := packet.Name.String()
@@ -878,11 +1151,15 @@ func (s *Multipath) handleDataTransmissionInterest(
 		}
 		dtFaceRateControlEnabled = info.DtFaceRateControlEnabled
 	}
+	if failureSnapshot.Active {
+		dtFaces = dtFilterFacesWithoutFailure(dtFaces, failureSnapshot.FailedFace)
+	}
 	if len(dtFaces) == 0 {
 		info.mu.Unlock()
-		core.Log.Warn(s, "DT forwarding failed: no valid upstream face after PD",
+		core.Log.Warn(s, "DT forwarding failed: no valid upstream face after PD/failure filtering",
 			"name", interestName,
-			"prefix", prefixKey)
+			"prefix", prefixKey,
+			"blockedFace", failureSnapshot.FailedFace)
 		return
 	}
 
@@ -899,7 +1176,7 @@ func (s *Multipath) handleDataTransmissionInterest(
 		return
 	}
 
-	s.ensureDtControlActivated(prefixKey, dtFaces, time.Now())
+	s.ensureDtControlActivated(prefixKey, dtFaces, now)
 	readyFaces, unreadyFaces := splitDtShapingReadyFaces(dtFaces)
 
 	// Pre-shaping bootstrap mode:
@@ -2472,6 +2749,11 @@ func (s *Multipath) allocateDtFaceBudgets(upstreamFace uint64, now time.Time, sc
 	if !control.activated || control.rate <= 0 {
 		return
 	}
+	if s.dtBlockedFace(now, upstreamFace) {
+		ensureDtControlThreadSlotsLocked(control)
+		clearDtFaceBlockedStateLocked(control, now)
+		return
+	}
 
 	ensureDtControlThreadSlotsLocked(control)
 	totalDemand := 0
@@ -2542,6 +2824,9 @@ func (s *Multipath) logDtConsumeAttempt(now time.Time, upstreamFace uint64, pend
 }
 
 func (s *Multipath) drainDtInterestForFace(now time.Time, upstreamFace uint64) {
+	if s.dtBlockedFace(now, upstreamFace) {
+		return
+	}
 	pending := s.localPendingInterestsForFace(upstreamFace)
 	if pending == 0 {
 		return
@@ -2948,6 +3233,13 @@ func (s *Multipath) runDtControllerTick(now time.Time, schedulerEpoch uint64) {
 		if !ok || control == nil {
 			return true
 		}
+		if s.dtBlockedFace(now, face) {
+			control.mu.Lock()
+			ensureDtControlThreadSlotsLocked(control)
+			clearDtFaceBlockedStateLocked(control, now)
+			control.mu.Unlock()
+			return true
+		}
 
 		shouldRun := false
 		control.mu.Lock()
@@ -2984,6 +3276,7 @@ func (s *Multipath) runDtFastSchedulerEpochIfDue(now time.Time) {
 // the forwarding thread strategy ticker cadence.
 func (s *Multipath) OnTick(_ time.Time) {
 	actualNow := time.Now()
+	s.syncDtFailureState(actualNow)
 	s.runDtFastSchedulerEpochIfDue(actualNow)
 	s.drainLocalDtQueues(actualNow)
 }
@@ -3728,6 +4021,7 @@ func (s *Multipath) localNodeConverged(info *PathDiscoveryInfo) {
 		info.DtFaceRateControlEnabled = len(info.DtValidFaces) > 1
 		info.DtBootstrapFaceRR = 0
 		info.DtBootstrapProbeCounter = 0
+		s.armDtFailureAfterPdConvergence(info, time.Now())
 		if info.DtFaceRateControlEnabled {
 			s.ensureDtControlActivated(info.Prefix, info.DtValidFaces, time.Now())
 		} else {

@@ -32,7 +32,21 @@ NUM_PRODUCERS_PER_CONSUMER = 5
 
 # 3. Network Loss
 #    - Packet loss % on links between Consumers and Cores.
-CON_TO_CORE_LOSS = 0.1
+CON_TO_CORE_LOSS = 0
+
+# 3b. Deployment Mode
+#    - "normal": deploy Mars multipath on con*/pro*, best-route on core*/edge*.
+#    - "minimal": deploy Mars multipath only on pro*, best-route elsewhere.
+DEPLOYMENT_MODE = "normal"
+
+# 3c. Failure Mode
+#    - "normal": no injected Mars face failure.
+#    - "face-disable": on con* Mars forwarders, disable one DT-valid face during
+#      the configured failure window after all active prefixes finish PD.
+# FAILURE_MODE = "normal"
+FAILURE_MODE = "face-disable"
+FAILURE_START_SEC = 1.0
+FAILURE_END_SEC = 3.0
 
 # 4. Start Delays
 #    - Staggering start times to prevent initial ARP/Routing storms.
@@ -186,6 +200,35 @@ def check_scaling_limits():
         print(f"   - con{i} will request from: pro{start_idx} ... pro{end_idx} (Count: {NUM_PRODUCERS_PER_CONSUMER})")
     print("")
 
+    if DEPLOYMENT_MODE not in {"normal", "minimal"}:
+        print(f"❌ Error: DEPLOYMENT_MODE ({DEPLOYMENT_MODE}) must be either 'normal' or 'minimal'.")
+        sys.exit(1)
+
+    print(f"✅ Deployment Mode: {DEPLOYMENT_MODE}")
+
+    if FAILURE_MODE not in {"normal", "face-disable"}:
+        print(f"❌ Error: FAILURE_MODE ({FAILURE_MODE}) must be either 'normal' or 'face-disable'.")
+        sys.exit(1)
+
+    if FAILURE_MODE != "normal" and DEPLOYMENT_MODE != "normal":
+        print(
+            f"❌ Error: FAILURE_MODE ({FAILURE_MODE}) requires DEPLOYMENT_MODE='normal' "
+            f"(current: {DEPLOYMENT_MODE})."
+        )
+        sys.exit(1)
+
+    if FAILURE_START_SEC < 0 or FAILURE_END_SEC <= FAILURE_START_SEC:
+        print(
+            f"❌ Error: failure window must satisfy 0 <= start < end "
+            f"(current: start={FAILURE_START_SEC}, end={FAILURE_END_SEC})."
+        )
+        sys.exit(1)
+
+    print(
+        f"✅ Failure Mode: {FAILURE_MODE} "
+        f"(window={FAILURE_START_SEC:.1f}s-{FAILURE_END_SEC:.1f}s)"
+    )
+
 class IPAllocator:
     def __init__(self, links):
         self.links = links
@@ -328,6 +371,10 @@ def loss_label(loss_value):
 def prepare_run_logs_dir():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     logs_root = os.path.join(script_dir, '..', 'logs')
+    if DEPLOYMENT_MODE == "minimal":
+        logs_root = os.path.join(logs_root, 'minimal')
+    if FAILURE_MODE != "normal":
+        logs_root = os.path.join(logs_root, 'failure', FAILURE_MODE.replace('-', '_'))
     loss_dir = os.path.join(logs_root, loss_label(CON_TO_CORE_LOSS))
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     run_dir = os.path.join(loss_dir, timestamp)
@@ -407,6 +454,8 @@ def start_ndnd_daemons(net, allocator, logs_dir):
     print(f"\nStarting ndnd daemons on {len(NODES)} nodes...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     configs_dir = os.path.join(script_dir, '..', 'configs')
+    failure_start_ms = int(FAILURE_START_SEC * 1000)
+    failure_end_ms = int(FAILURE_END_SEC * 1000)
 
     # Always regenerate/override all configs from the current topology before daemon start.
     regenerate_all_node_configs(allocator)
@@ -417,7 +466,15 @@ def start_ndnd_daemons(net, allocator, logs_dir):
         log_path = os.path.join(logs_dir, f'{node_name}.log')
         node.cmd('mkdir -p /run/nfd')
         node.cmd('rm -f /run/nfd/nfd.sock') 
-        node.cmd(f'env MARS_LOG_DIR={logs_dir} NDN_LOG=trace ndnd daemon {config_path} > {log_path} 2>&1 &')
+        node.cmd(
+            f'env MARS_LOG_DIR={logs_dir} '
+            f'MARS_DEPLOYMENT_MODE={DEPLOYMENT_MODE} '
+            f'MARS_FAILURE_MODE={FAILURE_MODE} '
+            f'MARS_FAILURE_START_MS={failure_start_ms} '
+            f'MARS_FAILURE_END_MS={failure_end_ms} '
+            f'MARS_FAILURE_PREFIX_COUNT={NUM_PRODUCERS_PER_CONSUMER} '
+            f'NDN_LOG=trace ndnd daemon {config_path} > {log_path} 2>&1 &'
+        )
         time.sleep(0.05) 
     print("All ndnd daemons started.")
 
@@ -460,7 +517,38 @@ def get_consumer_core_face_ids(con_node, con_name, allocator):
     return core_faces
 
 
+def install_strategies_for_mode(net):
+    if DEPLOYMENT_MODE == "normal":
+        strategy_groups = collections.OrderedDict([
+            ("Consumers", ([f'con{i}' for i in range(TOTAL_TOPO_CONSUMERS)], "/localhost/nfd/strategy/multipath/v=1")),
+            ("Cores", ([f'core{i}' for i in range(TOTAL_TOPO_CORES)], "/localhost/nfd/strategy/best-route/v=1")),
+            ("Edges", ([f'edge{i}' for i in range(TOTAL_TOPO_EDGES)], "/localhost/nfd/strategy/best-route/v=1")),
+            ("Producers", ([f'pro{i}' for i in range(TOTAL_TOPO_PRODUCERS)], "/localhost/nfd/strategy/multipath/v=1")),
+        ])
+    elif DEPLOYMENT_MODE == "minimal":
+        strategy_groups = collections.OrderedDict([
+            ("Consumers", ([f'con{i}' for i in range(TOTAL_TOPO_CONSUMERS)], "/localhost/nfd/strategy/best-route/v=1")),
+            ("Cores", ([f'core{i}' for i in range(TOTAL_TOPO_CORES)], "/localhost/nfd/strategy/best-route/v=1")),
+            ("Edges", ([f'edge{i}' for i in range(TOTAL_TOPO_EDGES)], "/localhost/nfd/strategy/best-route/v=1")),
+            ("Producers", ([f'pro{i}' for i in range(TOTAL_TOPO_PRODUCERS)], "/localhost/nfd/strategy/multipath/v=1")),
+        ])
+    else:
+        raise RuntimeError(f"Unsupported DEPLOYMENT_MODE: {DEPLOYMENT_MODE}")
+
+    print(f"\n=== Configuring Strategy by Layer ({DEPLOYMENT_MODE}) ===")
+    for group_name, (node_names, strategy_name) in strategy_groups.items():
+        for node_name in node_names:
+            net.get(node_name).cmd(f'ndnd fw strategy-set prefix=/ strategy={strategy_name}')
+        print(f"  -> {group_name}: Strategy set to {strategy_name} on {len(node_names)} node(s).")
+
+
 def configure_dynamic_routing(net, allocator):
+    install_strategies_for_mode(net)
+
+    if DEPLOYMENT_MODE == "minimal":
+        print("\n=== Skipping consumer-side route injection (minimal deployment) ===")
+        return
+
     print(f"\n=== Configuring Dynamic Routes for {NUM_ACTIVE_CONSUMERS} Consumers ===")
     consumers = [f'con{i}' for i in range(NUM_ACTIVE_CONSUMERS)]
     
@@ -498,19 +586,11 @@ def configure_dynamic_routing(net, allocator):
         
         print(f"  -> {con_name}: Added {added_count} consumer-core backup routes across {len(core_faces)} core face(s).")
 
-    print(f"\n=== Configuring Strategy by Layer ===")
-    strategy_groups = collections.OrderedDict([
-        ("Consumers", ([f'con{i}' for i in range(TOTAL_TOPO_CONSUMERS)], "/localhost/nfd/strategy/multipath/v=1")),
-        ("Cores", ([f'core{i}' for i in range(TOTAL_TOPO_CORES)], "/localhost/nfd/strategy/best-route/v=1")),
-        ("Edges", ([f'edge{i}' for i in range(TOTAL_TOPO_EDGES)], "/localhost/nfd/strategy/best-route/v=1")),
-        ("Producers", ([f'pro{i}' for i in range(TOTAL_TOPO_PRODUCERS)], "/localhost/nfd/strategy/multipath/v=1")),
-    ])
-    for group_name, (node_names, strategy_name) in strategy_groups.items():
-        for node_name in node_names:
-            net.get(node_name).cmd(f'ndnd fw strategy-set prefix=/ strategy={strategy_name}')
-        print(f"  -> {group_name}: Strategy set to {strategy_name} on {len(node_names)} node(s).")
-
 def verify_dynamic_routing_shape_or_die(net):
+    if DEPLOYMENT_MODE != "normal":
+        print(f"Skipping dynamic routing verification in {DEPLOYMENT_MODE} deployment.")
+        return
+
     if NUM_ACTIVE_CONSUMERS <= 0:
         return
 
@@ -591,7 +671,7 @@ def run_applications(net, allocator, logs_dir):
         p_log = os.path.join(logs_dir, f'{node_name}_app.log')
         app_name = f"{node_name}app"
         prefix = f"/pro{i}"
-        p_node.cmd(f'env MARS_LOG_DIR={logs_dir} {p_bin} {app_name} {prefix} > {p_log} 2>&1 &')
+        p_node.cmd(f'env MARS_LOG_DIR={logs_dir} MARS_DEPLOYMENT_MODE={DEPLOYMENT_MODE} {p_bin} {app_name} {prefix} > {p_log} 2>&1 &')
         time.sleep(0.1)
 
     print("Waiting 5s for producers to register...")
@@ -626,7 +706,7 @@ def run_applications(net, allocator, logs_dir):
         # Arguments: <node_name> <producer_range>
         # TODO: debug pd mode
         # c_node.cmd(f'{c_bin} {c_name}app {range_arg} ModeDT > {c_log} 2>&1 &')
-        c_node.cmd(f'env MARS_LOG_DIR={logs_dir} {c_bin} {c_name}app {range_arg} ModePD > {c_log} 2>&1 &')
+        c_node.cmd(f'env MARS_LOG_DIR={logs_dir} MARS_DEPLOYMENT_MODE={DEPLOYMENT_MODE} {c_bin} {c_name}app {range_arg} ModePD > {c_log} 2>&1 &')
     
     print("All applications running.")
 
