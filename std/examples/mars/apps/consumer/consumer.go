@@ -31,8 +31,8 @@ const (
 
 	// RTT & Retransmission Defaults (DT Only)
 	RTT_WINDOW_DURATION = 600 * time.Millisecond
-	MIN_RTO             = 120.0
-	MAX_RTO             = 800.0
+	MIN_RTO             = 240.0
+	MAX_RTO             = 1500.0
 	// Static DT control period used as the BW-estimator cadence reference.
 	DT_STATIC_CONTROL_PERIOD = 20 * time.Millisecond
 	// Set to true to force a fixed consumer DT control period. When false, the
@@ -1008,7 +1008,7 @@ func (f *FlowContext) updateRTT(receiveTime time.Time, rttVal float64) {
 		meanRTT = rttVal
 		variance = 0.0
 		calculatedRTO = math.Max(MIN_RTO, 2*rttVal)
-		finalRTO = 2 * calculatedRTO
+		finalRTO = 4 * calculatedRTO
 	} else {
 		var sum float64
 		for _, s := range f.rttHistory {
@@ -1023,7 +1023,7 @@ func (f *FlowContext) updateRTT(receiveTime time.Time, rttVal float64) {
 		variance = varSum / float64(count)
 		stdDev := math.Sqrt(variance)
 		calculatedRTO = meanRTT + 4*stdDev
-		finalRTO = 2 * calculatedRTO
+		finalRTO = 4 * calculatedRTO
 	}
 	if finalRTO < MIN_RTO {
 		finalRTO = MIN_RTO

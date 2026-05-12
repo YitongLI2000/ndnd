@@ -32,7 +32,7 @@ NUM_PRODUCERS_PER_CONSUMER = 5
 
 # 3. Network Loss
 #    - Packet loss % on links between Consumers and Cores.
-CON_TO_CORE_LOSS = 0
+CON_TO_CORE_LOSS = 1
 
 # 3b. Deployment Mode
 #    - "normal": deploy Mars multipath on con*/pro*, best-route on core*/edge*.
@@ -43,8 +43,8 @@ DEPLOYMENT_MODE = "normal"
 #    - "normal": no injected Mars face failure.
 #    - "face-disable": on con* Mars forwarders, disable one DT-valid face during
 #      the configured failure window after all active prefixes finish PD.
-# FAILURE_MODE = "normal"
-FAILURE_MODE = "face-disable"
+FAILURE_MODE = "normal"
+# FAILURE_MODE = "face-disable"
 FAILURE_START_SEC = 1.0
 FAILURE_END_SEC = 3.0
 
