@@ -32,14 +32,23 @@ NUM_PRODUCERS_PER_CONSUMER = 5
 
 # 3. Network Loss
 #    - Packet loss % on links between Consumers and Cores.
-CON_TO_CORE_LOSS = 1
+CON_TO_CORE_LOSS = 0.1
 
-# 3b. Deployment Mode
+# 3b. Core-Mesh Mode
+#    - "homogeneous": all core-core links stay at 40 Mbps.
+#    - "heterogeneous": only core-core links vary, cycling through
+#      40/50/60/70/80 Mbps in sorted core-pair order.
+# CORE_MESH_MODE = "homogeneous"
+CORE_MESH_MODE = "heterogeneous"
+HETEROGENEOUS_CORE_LINK_BWS_MBPS = [25, 40, 50, 60, 80]
+
+# 3c. Deployment Mode
 #    - "normal": deploy Mars multipath on con*/pro*, best-route on core*/edge*.
 #    - "minimal": deploy Mars multipath only on pro*, best-route elsewhere.
-DEPLOYMENT_MODE = "normal"
+DEPLOYMENT_MODE = "minimal"
+# DEPLOYMENT_MODE = "normal"
 
-# 3c. Failure Mode
+# 3d. Failure Mode
 #    - "normal": no injected Mars face failure.
 #    - "face-disable": on con* Mars forwarders, disable one DT-valid face during
 #      the configured failure window after all active prefixes finish PD.
@@ -160,12 +169,19 @@ def build_fixed_links():
     # Consumers connect to every core.
     for consumer_idx in range(TOTAL_TOPO_CONSUMERS):
         for core_idx in range(TOTAL_TOPO_CORES):
-            links.append((f'con{consumer_idx}', f'core{core_idx}', 40, '1ms', 1000, CON_TO_CORE_LOSS))
+            links.append((f'con{consumer_idx}', f'core{core_idx}', 40, '5ms', 1000, CON_TO_CORE_LOSS))
 
-    # Full core mesh (Lossless).
+    # Full core mesh (Lossless). In heterogeneous mode, only these links vary.
+    core_mesh_pair_index = 0
     for src_core in range(TOTAL_TOPO_CORES):
         for dst_core in range(src_core + 1, TOTAL_TOPO_CORES):
-            links.append((f'core{src_core}', f'core{dst_core}', 40, '1ms', 1000, 0))
+            core_bw = 40
+            if CORE_MESH_MODE == "heterogeneous":
+                core_bw = HETEROGENEOUS_CORE_LINK_BWS_MBPS[
+                    core_mesh_pair_index % len(HETEROGENEOUS_CORE_LINK_BWS_MBPS)
+                ]
+            links.append((f'core{src_core}', f'core{dst_core}', core_bw, '1ms', 1000, 0))
+            core_mesh_pair_index += 1
 
     return links
 
@@ -205,6 +221,15 @@ def check_scaling_limits():
         sys.exit(1)
 
     print(f"✅ Deployment Mode: {DEPLOYMENT_MODE}")
+
+    if CORE_MESH_MODE not in {"homogeneous", "heterogeneous"}:
+        print(
+            f"❌ Error: CORE_MESH_MODE ({CORE_MESH_MODE}) must be either "
+            f"'homogeneous' or 'heterogeneous'."
+        )
+        sys.exit(1)
+
+    print(f"✅ Core Mesh Mode: {CORE_MESH_MODE}")
 
     if FAILURE_MODE not in {"normal", "face-disable"}:
         print(f"❌ Error: FAILURE_MODE ({FAILURE_MODE}) must be either 'normal' or 'face-disable'.")
@@ -399,7 +424,7 @@ def create_topology_and_net():
         else:
             nodes_obj[n] = net.addHost(n, cls=LinuxRouter, privateDirs=['/run'], ip=None)
 
-    print(f"*** Adding Links (Loss: {CON_TO_CORE_LOSS}%)")
+    print(f"*** Adding Links (Loss: {CON_TO_CORE_LOSS}%, Core Mesh: {CORE_MESH_MODE})")
     for i, (src_name, dst_name, bw, delay, queue, loss_rate) in enumerate(LINKS):
         src = nodes_obj[src_name]
         dst = nodes_obj[dst_name]

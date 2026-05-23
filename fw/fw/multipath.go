@@ -96,12 +96,13 @@ const (
 	dtLivenessForcedPacketsPerStarvedRound = 2
 	dtLivenessForcedPacketsMax             = 32
 	dtLivenessStarvationLogThreshold       = 3
-	legacyDtFaceInitRatePps                = 700.0
-	legacyDtFaceInitPacketBytes            = 16 + (750 * 8)
-	targetDtFaceInitMbps                   = (legacyDtFaceInitRatePps * legacyDtFaceInitPacketBytes * 8.0) / 1e6
-	dtFaceTokenBurstCapPackets             = 64.0
-	dtRetainedBudgetCapPackets             = 1.0
-	dtBandwidthNoSampleWarnInterval        = 500 * time.Millisecond
+	// legacyDtFaceInitRatePps                = 700.0
+	legacyDtFaceInitRatePps         = 500.0
+	legacyDtFaceInitPacketBytes     = 16 + (750 * 8)
+	targetDtFaceInitMbps            = (legacyDtFaceInitRatePps * legacyDtFaceInitPacketBytes * 8.0) / 1e6
+	dtFaceTokenBurstCapPackets      = 64.0
+	dtRetainedBudgetCapPackets      = 1.0
+	dtBandwidthNoSampleWarnInterval = 500 * time.Millisecond
 	//! Per-thread logical DT Interest queue capacity used to normalize InterestQsf.
 	dtInterestQueueCapacityPackets = 20.0
 	// QSF smoothing uses only the latest few in-window samples even if the
