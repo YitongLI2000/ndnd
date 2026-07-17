@@ -1,0 +1,21 @@
+core:
+  log_level: INFO
+
+faces:
+  udp:
+    enabled_unicast: false
+    enabled_multicast: false
+  tcp:
+    enabled: true
+    port_unicast: 6363
+    lifetime: 600
+    reconnect_interval: 5
+  unix:
+    enabled: false
+  websocket:
+    enabled: false
+  http3:
+    enabled: false
+
+fw:
+  threads: 1
