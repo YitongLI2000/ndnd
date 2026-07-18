@@ -2,8 +2,10 @@ package engine
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/named-data/ndnd/std/engine/basic"
 	"github.com/named-data/ndnd/std/engine/face"
@@ -36,7 +38,10 @@ func NewDefaultFace() ndn.Face {
 	}
 
 	if uri.Scheme == "tcp" || uri.Scheme == "tcp4" || uri.Scheme == "tcp6" {
-		return face.NewStreamFace(uri.Scheme, uri.Host, false)
+		host := uri.Hostname()
+		ip := net.ParseIP(host)
+		isLocal := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+		return face.NewStreamFace(uri.Scheme, uri.Host, isLocal)
 	}
 
 	fmt.Fprintf(os.Stderr, "Unsupported transport URI: %s (invalid client config)\n", uri)

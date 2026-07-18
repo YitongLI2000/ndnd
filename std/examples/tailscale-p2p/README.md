@@ -30,6 +30,50 @@ CGO_ENABLED=0 go build -o ndnd ./cmd/ndnd
 Use a binary built for the local OS and architecture. Do not copy the Linux
 binary to macOS.
 
+### macOS one-command runner
+
+The macOS side can be built and started with the included runner:
+
+```sh
+std/examples/tailscale-p2p/run-macos.sh
+```
+
+The script checks Tailscale and TCP port 6363, builds the native `ndnd`
+binary, starts the forwarder, verifies its status, and runs `pingserver` for
+`/p2p/mac`. It prints the exact commands and detected Mac Tailscale address
+for the Linux side. Press Ctrl-C after the remote test to stop both Mac
+processes.
+
+Before involving Linux, validate the same forwarder and ping server entirely
+on the Mac:
+
+```sh
+std/examples/tailscale-p2p/run-macos.sh local-test
+```
+
+Set `SKIP_BUILD=1` to reuse an existing `./ndnd` binary. The runner also accepts
+`MAC_TS_IP`, `AGENT_A_TS_IP`, and `NDN_PING_PREFIX` environment overrides.
+
+If the default Go module proxy is unreachable, select a reachable proxy for
+this command only instead of changing the global Go configuration:
+
+```sh
+GOPROXY=https://goproxy.cn,direct \
+  std/examples/tailscale-p2p/run-macos.sh
+```
+
+Agent A is Linux/amd64. It can use a binary cross-compiled on the Mac, so its
+older system Go installation does not need to build this repository:
+
+```sh
+mkdir -p _build
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -o _build/ndnd-linux-amd64 ./cmd/ndnd
+```
+
+Copy `_build/ndnd-linux-amd64` to the repository root on Agent A as `ndnd` and
+mark it executable before starting the Linux-side forwarder.
+
 Find the Mac Tailscale IPv4 address and verify the overlay path from Linux:
 
 ```sh
