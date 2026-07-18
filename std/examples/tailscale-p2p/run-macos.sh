@@ -173,18 +173,11 @@ Mac side is ready:
 
 On Agent A, start its forwarder from the same repository revision:
 
-  export NDN_CLIENT_TRANSPORT=tcp://127.0.0.1:${PORT}
-  ./ndnd fw run std/examples/tailscale-p2p/fw.yml
+  MAC_TS_HOST=${MAC_TS_IP} NDN_PING_PREFIX=${PREFIX} \
+    std/examples/tailscale-p2p/run-linux.sh
 
-In a second Agent A terminal, create the route and run the test:
-
-  export NDN_CLIENT_TRANSPORT=tcp://127.0.0.1:${PORT}
-  tailscale ping ${MAC_TS_IP}
-  nc -vz ${MAC_TS_IP} ${PORT}
-  ./ndnd fw route-add prefix=${PREFIX} persistency=permanent face=tcp4://${MAC_TS_IP}:${PORT}
-  ./ndnd fw face-list
-  ./ndnd fw route-list
-  ./ndnd ping ${PREFIX} -c 5 -t 2000
+Agent A uses userspace Tailscale, so the Linux runner creates a local
+tailscale-nc bridge instead of dialing ${MAC_TS_IP}:${PORT} directly.
 
 Press Ctrl-C on this Mac when the remote test is complete.
 EOF

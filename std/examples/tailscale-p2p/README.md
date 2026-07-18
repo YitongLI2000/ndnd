@@ -1,69 +1,60 @@
 # NDNd Tailscale P2P Smoke Test
 
-This example verifies the smallest useful real-machine NDNd deployment:
+This example is the smallest real-machine NDNd test between Agent A (Linux)
+and a Mac. It uses only two NDNd forwarders, the built-in `ping` tools, one
+static route, and Tailscale. It does not start IOA, Docker, DV routing, or any
+MARS component.
 
 ```text
-Linux ping client
-  -> local NDNd forwarder
-  -> NDN-over-TCP through Tailscale
-  -> macOS NDNd forwarder
-  -> macOS ping server
+Linux ndnd ping
+  -> Linux NDNd (TCP 127.0.0.1:6363)
+  -> TCP face tcp4://127.0.0.1:16363
+  -> tailscale-nc bridge
+  -> Agent A isolated userspace Tailscale
+  -> Mac Tailscale address:6363
+  -> Mac NDNd
+  -> ndnd pingserver /p2p/mac
 ```
 
-It uses only the `ndnd` binary, the built-in `ping` and `pingserver` tools,
-and one static route. It does not use Docker, DV routing, or a custom app.
+Both Tailscale peers must be online at the same time for the cross-machine
+test. The Linux script starts only Agent A's isolated Tailscale daemon; the
+rest of IOA remains stopped. The Mac must have its normal Tailscale client
+online before the test starts.
 
-## 1. Prerequisites
+## Why Agent A needs a bridge
 
-- Linux and macOS are online in the same Tailscale tailnet.
-- Tailscale policy and the macOS firewall allow Linux to reach TCP port 6363
-  on the Mac.
-- A native `ndnd` binary is available on both machines.
-- Run every command from the repository root.
+Agent A runs `tailscaled` with `--tun=userspace-networking` and a private Unix
+socket. It therefore has no `tailscale0` interface or host route to a Mac
+`100.x.y.z` address. A direct face such as
+`tcp4://100.x.y.z:6363` cannot work on this host.
 
-Build the binary locally if needed (Go 1.24.3 or newer):
+`tailscale-nc-bridge.py` exposes `127.0.0.1:16363` and opens each outgoing
+connection with `tailscale --socket=... nc`. NDNd still uses an ordinary TCP
+face, while the bridge selects the correct userspace Tailscale instance. It is
+normal for `fw face-list` to show the remote endpoint as
+`tcp4://127.0.0.1:16363` in this smoke test.
+
+On a different Linux host with a kernel-mode Tailscale interface and a working
+route to `100.64.0.0/10`, the bridge is unnecessary; that host can create an
+NDNd TCP face directly to the Mac Tailscale address.
+
+## Prerequisites
+
+- The repository is on the same revision on Linux and macOS.
+- Native `ndnd` binaries can be built on both machines with Go 1.24.3 or newer,
+  or an existing native binary is available.
+- The Mac Tailscale client is online and the Mac firewall allows its NDNd TCP
+  listener on port 6363.
+- Commands are run from the repository root.
+
+Build a native binary manually when needed:
 
 ```sh
 CGO_ENABLED=0 go build -o ndnd ./cmd/ndnd
 ```
 
-Use a binary built for the local OS and architecture. Do not copy the Linux
-binary to macOS.
-
-### macOS one-command runner
-
-The macOS side can be built and started with the included runner:
-
-```sh
-std/examples/tailscale-p2p/run-macos.sh
-```
-
-The script checks Tailscale and TCP port 6363, builds the native `ndnd`
-binary, starts the forwarder, verifies its status, and runs `pingserver` for
-`/p2p/mac`. It prints the exact commands and detected Mac Tailscale address
-for the Linux side. Press Ctrl-C after the remote test to stop both Mac
-processes.
-
-Before involving Linux, validate the same forwarder and ping server entirely
-on the Mac:
-
-```sh
-std/examples/tailscale-p2p/run-macos.sh local-test
-```
-
-Set `SKIP_BUILD=1` to reuse an existing `./ndnd` binary. The runner also accepts
-`MAC_TS_IP`, `AGENT_A_TS_IP`, and `NDN_PING_PREFIX` environment overrides.
-
-If the default Go module proxy is unreachable, select a reachable proxy for
-this command only instead of changing the global Go configuration:
-
-```sh
-GOPROXY=https://goproxy.cn,direct \
-  std/examples/tailscale-p2p/run-macos.sh
-```
-
-Agent A is Linux/amd64. It can use a binary cross-compiled on the Mac, so its
-older system Go installation does not need to build this repository:
+Do not copy a Linux binary to macOS. If Linux cannot build locally, the Mac can
+cross-compile a Linux/amd64 binary and transfer it:
 
 ```sh
 mkdir -p _build
@@ -71,133 +62,159 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   go build -o _build/ndnd-linux-amd64 ./cmd/ndnd
 ```
 
-Copy `_build/ndnd-linux-amd64` to the repository root on Agent A as `ndnd` and
-mark it executable before starting the Linux-side forwarder.
+## Recommended two-command test
 
-Find the Mac Tailscale IPv4 address and verify the overlay path from Linux:
+### 1. Start the Mac
+
+On the Mac, keep this command running:
 
 ```sh
-# Run on macOS and record the 100.x.y.z address.
-tailscale ip -4
-
-# Run on Linux, replacing the example address.
-tailscale ping 100.x.y.z
+std/examples/tailscale-p2p/run-macos.sh serve
 ```
 
-Use the numeric Tailscale IPv4 address for this first test instead of a DNS
-name. The rest of this guide calls it `MAC_TS_IP`.
+The runner detects the Mac Tailscale IPv4 address, builds `ndnd`, starts the
+Mac forwarder, and registers `/p2p/mac` with `pingserver`. It then prints the
+Linux command. Use `SKIP_BUILD=1` to reuse an existing `./ndnd` binary.
 
-## 2. Start the macOS side
+Before involving Linux, the Mac side can be checked entirely locally:
 
-Open terminal 1 on the Mac and start the forwarder:
+```sh
+std/examples/tailscale-p2p/run-macos.sh local-test
+```
+
+If a Go module proxy is unavailable, select another proxy only for this run:
+
+```sh
+GOPROXY=https://goproxy.cn,direct \
+  std/examples/tailscale-p2p/run-macos.sh serve
+```
+
+### 2. Run the Linux test
+
+With the Mac runner still active, run this on Agent A:
+
+```sh
+std/examples/tailscale-p2p/run-linux.sh
+```
+
+The default target is the Tailscale name `castermacbook`. To use the numeric
+address printed by the Mac runner instead:
+
+```sh
+MAC_TS_HOST=100.77.224.3 \
+  std/examples/tailscale-p2p/run-linux.sh
+```
+
+The Linux runner performs the complete one-shot test:
+
+1. Reuses or starts only Agent A's private userspace Tailscale daemon.
+2. Runs `tailscale ping` through its private socket.
+3. Builds the Linux `ndnd` binary unless `SKIP_BUILD=1` is set.
+4. Starts the local bridge and Linux NDNd forwarder.
+5. Adds `/p2p/mac` through `tcp4://127.0.0.1:16363`.
+6. Prints the face and route tables and sends five NDN pings.
+7. Stops the forwarder and bridge. If it started Tailscale, it stops that too.
+
+The runner derives `GOROOT` from the selected Go executable, so an unrelated
+inherited `GOROOT` does not mix standard libraries from different Go versions.
+
+Use a prebuilt binary without rebuilding:
+
+```sh
+SKIP_BUILD=1 NDND_BINARY=/path/to/ndnd \
+  std/examples/tailscale-p2p/run-linux.sh
+```
+
+Set `KEEP_TAILSCALE=1` only when the private Agent A Tailscale daemon should
+remain running after the test. A daemon that was already running before the
+script is always left running.
+
+## Expected result
+
+Linux should print five lines containing `content from /p2p/mac` and finish
+with `P2P NDN ping test passed.` The Mac terminal should print five
+`interest received` lines.
+
+Only Linux needs the static route for this test. The returned Data follows the
+reverse PIT path, so the Mac does not need a route back to Linux.
+
+## Manual Linux workflow
+
+The automated runner is preferred, but these commands expose the exact Agent A
+path for diagnosis. Start only its private Tailscale instance:
+
+```sh
+/srv/yitong/ioa/scripts/agent_a_tailscale_nc/start_tailscaled.sh
+
+TS_SOCKET=/srv/yitong/ioa/.ioa_runtime/agent_a/tailscale/run/tailscaled.sock
+/usr/bin/tailscale --socket="${TS_SOCKET}" status
+/usr/bin/tailscale --socket="${TS_SOCKET}" ping castermacbook
+```
+
+In a second Linux terminal, start the bridge:
+
+```sh
+TS_SOCKET=/srv/yitong/ioa/.ioa_runtime/agent_a/tailscale/run/tailscaled.sock
+python3 std/examples/tailscale-p2p/tailscale-nc-bridge.py \
+  --listen-host 127.0.0.1 \
+  --listen-port 16363 \
+  --target-host castermacbook \
+  --target-port 6363 \
+  --tailscale-socket "${TS_SOCKET}"
+```
+
+In a third terminal, start the Linux forwarder:
 
 ```sh
 export NDN_CLIENT_TRANSPORT=tcp://127.0.0.1:6363
 ./ndnd fw run std/examples/tailscale-p2p/fw.yml
 ```
 
-Keep it running. This example intentionally uses `ndnd fw run`, not
-`ndnd daemon`, so that every OS uses TCP for the local application connection.
-
-Open terminal 2 on the Mac, set the same environment variable, verify the
-forwarder, and start the built-in server:
+In a fourth terminal, add the bridged face and run the ping:
 
 ```sh
 export NDN_CLIENT_TRANSPORT=tcp://127.0.0.1:6363
-./ndnd fw status
-./ndnd pingserver /p2p/mac
-```
-
-The server registers `/p2p/mac` with the local Mac forwarder and then waits for
-Interests.
-
-## 3. Start the Linux side
-
-Open terminal 1 on Linux and start the forwarder with the same configuration:
-
-```sh
-export NDN_CLIENT_TRANSPORT=tcp://127.0.0.1:6363
-./ndnd fw run std/examples/tailscale-p2p/fw.yml
-```
-
-Open terminal 2 on Linux. Set the local client transport and enter the actual
-Mac Tailscale IPv4 address:
-
-```sh
-export NDN_CLIENT_TRANSPORT=tcp://127.0.0.1:6363
-MAC_TS_IP=100.x.y.z
-```
-
-Install a static route. This command also creates a permanent TCP face to the
-Mac forwarder:
-
-```sh
 ./ndnd fw route-add \
   prefix=/p2p/mac \
   persistency=permanent \
-  face=tcp4://${MAC_TS_IP}:6363
-```
-
-Verify the resulting face and route:
-
-```sh
+  face=tcp4://127.0.0.1:16363
 ./ndnd fw face-list
 ./ndnd fw route-list
-```
-
-The face list should contain `remote=tcp4://<MAC_TS_IP>:6363`, and the route
-list should contain `prefix=/p2p/mac`.
-
-## 4. Run the test
-
-On Linux:
-
-```sh
 ./ndnd ping /p2p/mac -c 5 -t 2000
 ```
 
-Success has two visible results:
-
-- Linux prints five `content from /p2p/mac` responses and RTT values.
-- The Mac ping server prints five `interest received` lines.
-
-Data follows the reverse PIT path, so the Mac does not need a static route back
-to Linux for this one-way ping test.
-
-## 5. Troubleshooting
-
-If a local command reports `Unable to start engine`:
-
-- Confirm the local forwarder is still running.
-- Confirm `NDN_CLIENT_TRANSPORT=tcp://127.0.0.1:6363` is set in that terminal.
-
-If the ping times out, check the underlay before NDNd:
+Stop the manually started Agent A Tailscale daemon after the test:
 
 ```sh
-# Linux to Mac
-tailscale ping ${MAC_TS_IP}
-nc -vz ${MAC_TS_IP} 6363
+/srv/yitong/ioa/scripts/agent_a_tailscale_nc/stop_tailscaled.sh
+```
 
-# macOS: confirm the NDNd TCP listener
+## Troubleshooting
+
+If Linux reports that the Mac Tailscale peer is unreachable, confirm that the
+Mac client and the Agent A private daemon are both online. Always pass the
+private socket on Agent A; a plain `tailscale status` may inspect an unrelated
+system or another user's daemon.
+
+If Tailscale ping succeeds but NDN ping times out, check the Mac while its
+runner is active:
+
+```sh
 lsof -nP -iTCP:6363 -sTCP:LISTEN
 ```
 
-Then inspect NDNd on Linux:
+Then inspect the runtime directory printed by the Linux runner. `bridge.log`
+contains errors from `tailscale nc`, while `forwarder.log` contains NDNd face
+and forwarding events. Also check the Mac firewall and Tailscale policy for
+TCP port 6363.
+
+If a local NDNd command reports `Unable to start engine`, confirm that the
+local forwarder is running and that this variable is set in the same terminal:
 
 ```sh
-./ndnd fw face-list
-./ndnd fw route-list
+export NDN_CLIENT_TRANSPORT=tcp://127.0.0.1:6363
 ```
 
-Also check the Tailscale policy, the macOS firewall prompt, and any host
-firewall rules. The NDNd TCP listener binds all host interfaces, so port 6363
-should be restricted to the Tailscale peers during this test.
-
-On Linux, the current forwarder may still log a UDP listener even though UDP is
-disabled in `fw.yml`. This does not affect the TCP path in this smoke test.
-
-## 6. Stop and reset
-
-Press Ctrl-C in the pingserver and forwarder terminals. Faces and routes in this
-example are runtime state and disappear when the Linux forwarder exits, so the
-`route-add` command must be run again after a restart.
+The forwarder listener binds host interfaces, not only the Tailscale address.
+Restrict TCP port 6363 to trusted peers during experiments beyond this smoke
+test.
