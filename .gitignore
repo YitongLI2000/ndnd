@@ -34,3 +34,5 @@ std/examples/**/apps/producer/producer.exe
 std/examples/mars/configs/*
 std/examples/mars/reference/*
 std/examples/mars/logs/*
+
+std/examples/**/logs

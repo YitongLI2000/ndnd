@@ -10,10 +10,13 @@ readonly PORT=6363
 readonly PREFIX="${NDN_PING_PREFIX:-/p2p/mac}"
 readonly AGENT_A_TS_IP="${AGENT_A_TS_IP:-100.81.98.57}"
 readonly MODE="${1:-serve}"
-readonly RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ndnd-p2p-macos.XXXXXX")"
-readonly FORWARDER_LOG="${RUNTIME_DIR}/forwarder.log"
-readonly PINGSERVER_LOG="${RUNTIME_DIR}/pingserver.log"
+readonly LOG_ROOT="${NDN_LOG_DIR:-${SCRIPT_DIR}/logs}"
 
+RUNTIME_DIR=""
+FORWARDER_LOG=""
+PINGSERVER_LOG=""
+CLIENT_LOG=""
+CHECKPOINT_FILE=""
 FORWARDER_PID=""
 PINGSERVER_PID=""
 TAIL_PID=""
@@ -31,6 +34,7 @@ Environment overrides:
   MAC_TS_IP          Mac Tailscale IPv4 address (detected by default).
   AGENT_A_TS_IP      Agent A Tailscale IPv4 address (default: 100.81.98.57).
   NDN_PING_PREFIX    Served NDN prefix (default: /p2p/mac).
+  NDN_LOG_DIR        Checkpoint root (default: tailscale-p2p/logs).
   SKIP_BUILD=1       Reuse the existing ./ndnd binary.
 EOF
 }
@@ -42,6 +46,61 @@ die() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+init_checkpoint() {
+  local base_dir
+  local git_commit
+  local go_version
+  local started_at
+
+  started_at="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  base_dir="${LOG_ROOT}/checkpoint-$(date '+%Y%m%d-%H%M%S')-${MODE}"
+  RUNTIME_DIR="${base_dir}"
+  if [[ -e "${RUNTIME_DIR}" ]]; then
+    RUNTIME_DIR="${base_dir}-$$"
+  fi
+
+  mkdir -p "${RUNTIME_DIR}" || die "Unable to create checkpoint directory: ${RUNTIME_DIR}"
+  FORWARDER_LOG="${RUNTIME_DIR}/forwarder.log"
+  PINGSERVER_LOG="${RUNTIME_DIR}/pingserver.log"
+  CLIENT_LOG="${RUNTIME_DIR}/client.log"
+  CHECKPOINT_FILE="${RUNTIME_DIR}/checkpoint.txt"
+
+  git_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+  go_version="$(go version 2>/dev/null || printf 'unavailable')"
+
+  {
+    printf 'started_at: %s\n' "${started_at}"
+    printf 'mode: %s\n' "${MODE}"
+    printf 'prefix: %s\n' "${PREFIX}"
+    printf 'agent_a_tailscale_ip: %s\n' "${AGENT_A_TS_IP}"
+    printf 'git_commit: %s\n' "${git_commit}"
+    printf 'go_version: %s\n' "${go_version}"
+    printf 'forwarder_log: %s\n' "${FORWARDER_LOG}"
+    printf 'pingserver_log: %s\n' "${PINGSERVER_LOG}"
+    printf 'client_log: %s\n' "${CLIENT_LOG}"
+  } >"${CHECKPOINT_FILE}"
+
+  echo "Checkpoint directory: ${RUNTIME_DIR}"
+}
+
+finish_checkpoint() {
+  local exit_code="$1"
+  local result
+
+  case "${exit_code}" in
+    0) result="completed" ;;
+    129|130|143) result="stopped" ;;
+    *) result="failed" ;;
+  esac
+
+  {
+    printf 'finished_at: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf 'result: %s\n' "${result}"
+    printf 'exit_code: %s\n' "${exit_code}"
+    printf 'mac_tailscale_ip: %s\n' "${MAC_TS_IP:-not-detected}"
+  } >>"${CHECKPOINT_FILE}"
 }
 
 is_ipv4() {
@@ -66,6 +125,7 @@ cleanup() {
   stop_child "${TAIL_PID}" "log follower"
   stop_child "${PINGSERVER_PID}" "ping server"
   stop_child "${FORWARDER_PID}" "forwarder"
+  finish_checkpoint "${exit_code}"
 
   case "${exit_code}" in
     0|129|130|143) ;;
@@ -77,7 +137,7 @@ cleanup() {
       ;;
   esac
 
-  echo "Runtime logs: ${RUNTIME_DIR}"
+  echo "Checkpoint logs: ${RUNTIME_DIR}"
   exit "${exit_code}"
 }
 
@@ -169,6 +229,7 @@ Mac side is ready:
   Tailscale IPv4 : ${MAC_TS_IP}
   NDN prefix     : ${PREFIX}
   TCP listener   : ${MAC_TS_IP}:${PORT}
+  Checkpoint     : ${RUNTIME_DIR}
   Forwarder log  : ${FORWARDER_LOG}
 
 On Agent A, start its forwarder from the same repository revision:
@@ -210,7 +271,7 @@ start_pingserver() {
 
 run_local_test() {
   echo "Running five local NDN pings..."
-  "${BINARY}" ping "${PREFIX}" -c 5 -t 2000
+  "${BINARY}" ping "${PREFIX}" -c 5 -t 2000 | tee "${CLIENT_LOG}"
 
   echo
   echo "Ping server output:"
@@ -238,6 +299,7 @@ case "${MODE}" in
     ;;
 esac
 
+init_checkpoint
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -249,6 +311,7 @@ require_command lsof
 require_command nc
 require_command awk
 require_command grep
+require_command tee
 
 if [[ "${MODE}" == "serve" ]]; then
   require_command tailscale

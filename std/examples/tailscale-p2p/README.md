@@ -76,6 +76,21 @@ The runner detects the Mac Tailscale IPv4 address, builds `ndnd`, starts the
 Mac forwarder, and registers `/p2p/mac` with `pingserver`. It then prints the
 Linux command. Use `SKIP_BUILD=1` to reuse an existing `./ndnd` binary.
 
+Every actual run creates a timestamped checkpoint under `logs/`:
+
+```text
+std/examples/tailscale-p2p/logs/
+└── checkpoint-20260719-153045-serve/
+    ├── checkpoint.txt
+    ├── forwarder.log
+    └── pingserver.log
+```
+
+`local-test` checkpoints also contain `client.log`. `checkpoint.txt` records
+the start and finish times, mode, exit status, Git commit, Go version, prefix,
+and peer addresses. Checkpoints are kept after exit and ignored by Git. Set
+`NDN_LOG_DIR=/another/path` to override the checkpoint root.
+
 Before involving Linux, the Mac side can be checked entirely locally:
 
 ```sh
